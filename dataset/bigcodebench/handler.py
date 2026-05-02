@@ -15,7 +15,13 @@ class BigCodeBenchHandler(DatasetHandler):
     and test suites. Evaluation runs via the `bigcodebench.evaluate` CLI tool.
     """
 
-    GT_DATA_PATH = "dataset/bigcodebench/data/full_data.json"
+    # Resolved relative to this file so consumers don't need to chdir to the
+    # PDB repo root before invoking the handler. Override via env var if the
+    # data lives elsewhere (e.g., a downstream training repo with its own layout).
+    GT_DATA_PATH = os.environ.get(
+        "BCB_FULL_DATA_PATH",
+        str(Path(__file__).parent / "data" / "full_data.json"),
+    )
 
     def preprocess(self, raw_data):
         """
