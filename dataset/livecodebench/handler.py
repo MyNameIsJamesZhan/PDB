@@ -131,6 +131,32 @@ class LiveCodeBenchHandler(DatasetHandler):
 
         return fail_ids, correct_ids, ""
 
+    def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20, timeout=1800):
+        """Shape the JSON request that the LCB persistent worker expects.
+
+        LCB ignores gt_file (LCB.save_formatted_gt returns None). The map_file
+        sidecar is built alongside verify_file by build_verify_unit_test().
+        See PDB/dataset/livecodebench/install/worker_loop.py for the receiving end.
+        """
+        verify_path = Path(verify_file)
+        map_path = verify_path.with_name(verify_path.stem + "_map.json")
+        return {
+            "op": "score",
+            "verify_file": str(verify_path),
+            "map_file": str(map_path),
+        }
+
+    def parse_worker_response(self, resp):
+        """Unpack the worker's score response into (fail_ids, correct_ids, fail_feedback).
+
+        Matches verify_unit_test()'s third element ("" for LCB) so callers
+        can swap the two.
+        """
+        # LCB's verify_unit_test returns "" for fail_feedback (not a list).
+        # Worker returns a per-id list of empty strings; collapse to "" so
+        # downstream callers see the legacy shape.
+        return resp["fail_ids"], resp["correct_ids"], ""
+
     def build_verify_unit_test(self, log_file_prefix, results, sol_field="solution"):
         """
         Build a JSON verification file for lcb_runner's custom evaluator.
