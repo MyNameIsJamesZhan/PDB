@@ -32,12 +32,15 @@ cached `benchmark`.
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import json
 import os
 import sys
 import time
 import traceback
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -61,11 +64,94 @@ def _stdout_to_stderr():
         sys.stdout = old_stdout
 
 # Pay the heavy imports once at startup. After this point, sys.modules holds
-# everything LCB needs, so per-request invocations of `run()` only do the
-# actual evaluation work — no module-load tax.
-from lcb_runner.runner.custom_evaluator import run as run_custom_evaluator
+# everything LCB needs, so per-request invocations only do the actual
+# evaluation work — no module-load tax.
 from lcb_runner.runner.scenario_router import build_prompt_benchmark
 from lcb_runner.utils.scenarios import Scenario
+
+# Persistent-pool path uses the lower-level per-task function directly,
+# bypassing run_custom_evaluator + codegen_metrics' built-in pool spawn.
+from lcb_runner.evaluation.compute_code_generation_metrics import (
+    evaluate_generations_by_problem,
+)
+from lcb_runner.evaluation.pass_k_utils import compute_metrics_from_results
+
+# Legacy path (PDB_PERSISTENT_POOL!=1) still calls run_custom_evaluator
+# which builds a fresh multiprocessing.Pool every flush. Kept behind a
+# gate so we can A/B test against the new persistent-pool path without
+# ripping the old code out.
+_USE_PERSISTENT_POOL = os.environ.get("PDB_PERSISTENT_POOL", "0") == "1"
+if not _USE_PERSISTENT_POOL:
+    from lcb_runner.runner.custom_evaluator import run as run_custom_evaluator  # noqa: E402
+
+# Persistent ProcessPoolExecutor — built once in main() if
+# PDB_PERSISTENT_POOL=1. None if gated off.
+_POOL: ProcessPoolExecutor | None = None
+# Python 3.10 doesn't support `max_tasks_per_child`, so we recycle the
+# whole pool every N flushes to mitigate heap fragmentation.
+_POOL_FLUSH_COUNTER = 0
+_POOL_RECYCLE_EVERY = int(os.environ.get("PDB_LCB_POOL_RECYCLE_EVERY", "50"))
+# Per-candidate timeout passed to evaluate_generations_by_problem.
+# Matches the legacy _make_args(timeout=6).
+_DEFAULT_TIMEOUT = 6
+
+
+def _pool_child_init() -> None:
+    # Redirect fd 1 to fd 2 so descendants can't corrupt the JSON IPC stream.
+    os.dup2(2, 1)
+
+
+def _make_pool() -> ProcessPoolExecutor:
+    # Default 8 (not 12 like legacy num_process_evaluate) to reduce
+    # sustained scheduler pressure on the 16-CPU SLURM allocation. Today
+    # the pool lives only during a flush, but persistent pools are hot
+    # the entire training run.
+    n = int(os.environ.get("PDB_LCB_POOL_SIZE", "8"))
+    print(f"[lcb_worker] spawning persistent ProcessPoolExecutor max_workers={n}",
+          file=sys.stderr, flush=True)
+    t0 = time.monotonic()
+    pool = ProcessPoolExecutor(max_workers=n, initializer=_pool_child_init)
+    # ProcessPoolExecutor.__init__ does NOT fork workers — they're spawned
+    # lazily on first submit(). Force the fork now by running a no-op
+    # future per worker, so the first real flush doesn't pay the fork
+    # cost. Submit 2*n so every slot is touched (futures are racy across
+    # workers; oversubscribing the warm-up is the simplest reliable way).
+    warm_futures = [pool.submit(os.getpid) for _ in range(n * 2)]
+    warm_pids = {f.result() for f in warm_futures}
+    print(f"[lcb_worker] pool warmed in {time.monotonic() - t0:.1f}s "
+          f"(forked {len(warm_pids)} workers)",
+          file=sys.stderr, flush=True)
+    return pool
+
+
+def _ensure_pool() -> ProcessPoolExecutor:
+    """Lazy-construct the pool and recycle every _POOL_RECYCLE_EVERY
+    flushes. Recycling caps long-run RSS drift from Python heap
+    fragmentation.
+    """
+    global _POOL, _POOL_FLUSH_COUNTER
+    if _POOL is None:
+        _POOL = _make_pool()
+    elif _POOL_FLUSH_COUNTER >= _POOL_RECYCLE_EVERY:
+        print(f"[lcb_worker] recycling pool after {_POOL_FLUSH_COUNTER} flushes",
+              file=sys.stderr, flush=True)
+        _POOL.shutdown(wait=True, cancel_futures=False)
+        _POOL = _make_pool()
+        _POOL_FLUSH_COUNTER = 0
+    return _POOL
+
+
+def _shutdown_pool() -> None:
+    global _POOL
+    if _POOL is not None:
+        try:
+            _POOL.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        _POOL = None
+
+
+atexit.register(_shutdown_pool)
 
 
 def _make_args(custom_output_file: str | None = None) -> argparse.Namespace:
@@ -153,7 +239,163 @@ def _parse_eval(eval_path: Path,
     return fail_ids, correct_ids
 
 
-def _handle_score(req: dict, benchmark: list) -> dict:
+def _handle_score_pool(req: dict, benchmark: list) -> dict:
+    """Persistent-pool path: dispatch each candidate as its own future
+    on a long-lived ProcessPoolExecutor. Eliminates the per-flush pool
+    spawn that `evaluate_generations()` does inside its
+    `with ProcessPoolExecutor` block.
+
+    Per-task isolation is unchanged: the per-task function
+    `evaluate_generations_by_problem` still spawns a fresh
+    `multiprocessing.Process` per candidate (via `check_correctness` in
+    compute_code_generation_metrics.py) for sandboxing.
+
+    Reproduces the same `*_output_eval.json` shape that
+    `run_custom_evaluator` writes — `[metrics, results_dict,
+    final_metadata]` — so `_parse_eval` is unchanged.
+    """
+    verify_file = Path(req["verify_file"])
+    map_file = Path(req.get("map_file", verify_file.with_name(verify_file.stem + "_map.json")))
+
+    if not verify_file.exists():
+        raise FileNotFoundError(f"verify_file does not exist: {verify_file}")
+
+    with open(verify_file) as f:
+        verify_input = json.load(f)
+    ordered_qids = [d.get("question_id") for d in verify_input]
+    qid_to_full_ids = {}
+    if map_file.exists():
+        with open(map_file) as f:
+            qid_to_full_ids = json.load(f)
+
+    if not ordered_qids:
+        return {"fail_ids": [], "correct_ids": [], "fail_feedback": [], "elapsed_s": 0.0}
+
+    # Pair verify_input candidates with benchmark instances. Filter to
+    # qids present in both, then sort by question_id to match the
+    # convention `_parse_eval` expects (per_index keyed by
+    # str(idx_in_sorted_qids)). Upstream's sort_and_extract_save_results
+    # does the same sort (scenario_router.py:147).
+    out_by_id = {str(d["question_id"]): d["code_list"] for d in verify_input}
+    benchmark_by_id = {str(inst.question_id): inst for inst in benchmark}
+    common_qids = sorted(
+        qid for qid in (str(q) for q in ordered_qids)
+        if qid in out_by_id and qid in benchmark_by_id
+    )
+    if not common_qids:
+        # Nothing to score — emit empty eval file so _parse_eval can
+        # still parse without raising FileNotFoundError.
+        eval_path = verify_file.with_name(verify_file.stem + "_output_eval.json")
+        with open(eval_path, "w") as f:
+            json.dump([{}, {}, []], f)
+        return {"fail_ids": [], "correct_ids": [], "fail_feedback": [], "elapsed_s": 0.0}
+
+    t_setup_start = time.monotonic()
+    pool = _ensure_pool()
+    t_pool = time.monotonic()
+
+    # Linearize: one future per (problem_idx_in_sorted_order, candidate).
+    # Mirrors codegen_metrics' linearization
+    # (compute_code_generation_metrics.py:166-179) so the result
+    # aggregation is byte-identical.
+    samples_linear = []
+    generations_linear = []
+    remap_index = []  # future_idx -> sorted_problem_idx
+    generations_list_per_problem = []  # for the metadata length assertion
+    for sorted_idx, qid in enumerate(common_qids):
+        instance = benchmark_by_id[qid]
+        code_list = out_by_id[qid]
+        generations_list_per_problem.append(code_list)
+        with _stdout_to_stderr():
+            sample = instance.get_evaluation_sample()
+        for code in code_list:
+            samples_linear.append(sample)
+            generations_linear.append([code])
+            remap_index.append(sorted_idx)
+    t_build_samples = time.monotonic()
+
+    t0 = time.monotonic()
+
+    # Submit all candidates at once. evaluate_generations_by_problem's
+    # signature is `args = (generations_list, sample, debug, timeout)`.
+    futures = {}
+    for i in range(len(samples_linear)):
+        fut = pool.submit(
+            evaluate_generations_by_problem,
+            (generations_linear[i], samples_linear[i], False, _DEFAULT_TIMEOUT),
+        )
+        futures[fut] = i
+    t_submit = time.monotonic()
+
+    results_linear: dict[int, list] = {}
+    metadatas_linear: dict[int, list] = {}
+    for fut in as_completed(futures):
+        i = futures[fut]
+        res, meta = fut.result()
+        results_linear[i] = res
+        metadatas_linear[i] = meta
+    t_wait = time.monotonic()
+
+    elapsed = time.monotonic() - t0
+
+    # Re-aggregate by sorted_problem_idx — verbatim copy of codegen_metrics
+    # lines 191-211. Each linear future contributed one element to both
+    # lists (we passed a 1-element generations_list per future).
+    results: dict[int, list] = defaultdict(list)
+    metadatas: dict[int, list] = defaultdict(list)
+    for i in sorted(results_linear):
+        results[remap_index[i]].append(results_linear[i][0])
+        metadatas[remap_index[i]].append(metadatas_linear[i][0])
+
+    metrics_dict = compute_metrics_from_results(dict(results), k_list=[1])
+    t_metrics = time.monotonic()
+
+    final_metadata: list[list[str]] = []
+    for key in sorted(metadatas.keys()):
+        final_metadata.append(metadatas[key])
+    for i in range(len(final_metadata)):
+        if not isinstance(final_metadata[i], list):
+            final_metadata[i] = [json.dumps(final_metadata[i])]
+        else:
+            final_metadata[i] = [json.dumps(x) for x in final_metadata[i]]
+        # Same invariant codegen_metrics asserts. We construct the data,
+        # so this should always hold — assert defensively.
+        assert len(final_metadata[i]) == len(generations_list_per_problem[i]), (
+            f"{len(final_metadata[i])=} vs expected "
+            f"{len(generations_list_per_problem[i])} for sorted_idx {i}"
+        )
+
+    eval_data = [metrics_dict, dict(results), final_metadata]
+    eval_path = verify_file.with_name(verify_file.stem + "_output_eval.json")
+    with open(eval_path, "w") as f:
+        json.dump(eval_data, f, indent=4)
+    t_write = time.monotonic()
+
+    print(f"[lcb_worker] flush phases n_problems={len(common_qids)} "
+          f"n_futures={len(samples_linear)}: "
+          f"pool={t_pool - t_setup_start:.2f}s "
+          f"build_samples={t_build_samples - t_pool:.2f}s "
+          f"submit={t_submit - t0:.2f}s "
+          f"wait={t_wait - t_submit:.2f}s "
+          f"metrics={t_metrics - t_wait:.2f}s "
+          f"write={t_write - t_metrics:.2f}s "
+          f"total={t_write - t_setup_start:.2f}s",
+          file=sys.stderr, flush=True)
+
+    global _POOL_FLUSH_COUNTER
+    _POOL_FLUSH_COUNTER += 1
+
+    fail_ids, correct_ids = _parse_eval(eval_path, ordered_qids, qid_to_full_ids)
+
+    return {
+        "fail_ids": fail_ids,
+        "correct_ids": correct_ids,
+        "fail_feedback": [""] * len(fail_ids),
+        "elapsed_s": elapsed,
+    }
+
+
+def _handle_score_legacy(req: dict, benchmark: list) -> dict:
     verify_file = Path(req["verify_file"])
     map_file = Path(req.get("map_file", verify_file.with_name(verify_file.stem + "_map.json")))
 
@@ -192,6 +434,15 @@ def _handle_score(req: dict, benchmark: list) -> dict:
     }
 
 
+def _handle_score(req: dict, benchmark: list) -> dict:
+    """Route to persistent-pool path or legacy run_custom_evaluator path
+    based on PDB_PERSISTENT_POOL.
+    """
+    if _USE_PERSISTENT_POOL:
+        return _handle_score_pool(req, benchmark)
+    return _handle_score_legacy(req, benchmark)
+
+
 def main() -> int:
     # Mirror the legacy `cwd=self.install_dir` from
     # LiveCodeBenchHandler.verify_unit_test() — some lcb_runner internals may
@@ -199,12 +450,23 @@ def main() -> int:
     install_dir = Path(__file__).resolve().parent
     os.chdir(install_dir)
 
-    print("[lcb_worker] loading benchmark", file=sys.stderr, flush=True)
+    print(f"[lcb_worker] loading benchmark "
+          f"(persistent_pool={_USE_PERSISTENT_POOL})",
+          file=sys.stderr, flush=True)
     t0 = time.monotonic()
     with _stdout_to_stderr():
         benchmark, _ = build_prompt_benchmark(_make_args())
     print(f"[lcb_worker] loaded {len(benchmark)} problems in {time.monotonic() - t0:.1f}s",
           file=sys.stderr, flush=True)
+
+    # Eagerly build the persistent pool BEFORE emitting READY, so the
+    # one-time pool-spawn cost is folded into cold start instead of
+    # showing up on the first flush. Pool children fork from the master
+    # at this point — they inherit the loaded `benchmark` list via COW
+    # but never touch it (each request looks up via benchmark_by_id in
+    # the master), so the pages stay shared.
+    if _USE_PERSISTENT_POOL:
+        _ensure_pool()
 
     sys.stdout.write("READY\n")
     sys.stdout.flush()
@@ -231,6 +493,7 @@ def main() -> int:
                 _emit(result)
             elif op == "shutdown":
                 _emit({"req_id": req_id, "ok": True, "shutdown": True})
+                _shutdown_pool()
                 return 0
             else:
                 _emit({"req_id": req_id, "ok": False,
