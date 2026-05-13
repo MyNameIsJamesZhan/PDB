@@ -230,10 +230,13 @@ def _emit_error(req_id: str, exc: BaseException) -> None:
     })
 
 
-def _parse_results_dict(eval_dict: dict) -> tuple[list[str], list[str], list[str]]:
+def _parse_results_dict(eval_dict: dict, compact: bool = False) -> tuple[list[str], list[str], list[str]]:
     """Walk the `evaluate()`-shape results dict and split into
     (fail_ids, correct_ids, fail_feedback). Shared by both legacy and
-    persistent-pool paths.
+    persistent-pool paths. With compact=True, fail_feedback is a list of
+    empty strings — RL reward path never reads details and dumping
+    per-test tracebacks can push the JSON response past asyncio's 64 KiB
+    StreamReader limit, corrupting the whole flush's reward signal.
     """
     fail_ids: list[str] = []
     correct_ids: list[str] = []
@@ -244,7 +247,8 @@ def _parse_results_dict(eval_dict: dict) -> tuple[list[str], list[str], list[str
             correct_ids.append(task_id)
         else:
             fail_ids.append(task_id)
-            fail_feedback.append(json.dumps(perfs[0].get("details", ""), indent=2))
+            fail_feedback.append("" if compact
+                                 else json.dumps(perfs[0].get("details", ""), indent=2))
     return fail_ids, correct_ids, fail_feedback
 
 
@@ -374,7 +378,8 @@ def _handle_score_pool(req: dict) -> dict:
     global _POOL_FLUSH_COUNTER
     _POOL_FLUSH_COUNTER += 1
 
-    fail_ids, correct_ids, fail_feedback = _parse_results_dict(eval_dict)
+    fail_ids, correct_ids, fail_feedback = _parse_results_dict(
+        eval_dict, compact=req.get("compact_feedback", False))
     return {
         "fail_ids": fail_ids,
         "correct_ids": correct_ids,
@@ -456,7 +461,8 @@ def _handle_score_legacy(req: dict, problems: dict) -> dict:
         data = json.load(f)
 
     eval_dict = data.get("eval", {})
-    fail_ids, correct_ids, fail_feedback = _parse_results_dict(eval_dict)
+    fail_ids, correct_ids, fail_feedback = _parse_results_dict(
+        eval_dict, compact=req.get("compact_feedback", False))
 
     return {
         "fail_ids": fail_ids,

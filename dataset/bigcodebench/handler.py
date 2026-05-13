@@ -132,7 +132,8 @@ class BigCodeBenchHandler(DatasetHandler):
         else:
             raise FileNotFoundError(f"Cannot locate evaluation results for {base_name}")
 
-    def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20, timeout=1800):
+    def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20,
+                              timeout=1800, compact_feedback=False):
         """Shape the JSON request that the BCB persistent worker expects.
 
         The wire format passes verify_file + gt_file PATHS (not contents) —
@@ -140,6 +141,13 @@ class BigCodeBenchHandler(DatasetHandler):
         save_formatted_gt, and the worker reads them off the shared filesystem.
         Mirrors verify_unit_test()'s gt_file requirement: BCB always needs a
         gt_file because eval depends on the canonical task metadata.
+
+        compact_feedback=True drops per-test traceback / stdout / stderr from
+        fail_feedback (keeps the field as empty strings for protocol compat).
+        Caller should set this in the RL reward path — the details are never
+        read there, and emitting them can push the JSON response past
+        asyncio's 64 KiB StreamReader limit and corrupt the flush.
+
         See PDB/dataset/bigcodebench/install/worker_loop.py for the receiving end.
         """
         if gt_file is None:
@@ -154,6 +162,7 @@ class BigCodeBenchHandler(DatasetHandler):
             "verify_file": str(verify_file),
             "gt_file": str(gt_file),
             "timeout_per_task": timeout_per_task,
+            "compact_feedback": compact_feedback,
         }
 
     def parse_worker_response(self, resp):
