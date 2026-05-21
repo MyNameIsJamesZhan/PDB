@@ -52,13 +52,28 @@ def timeout_handler(signum, frame):
     raise TimeoutException
 
 
+# Drop stdout writes past 1 MiB to bound RSS when a candidate floods print(...).
+_CAPTURE_MAX_CHARS = 1 * 1024 * 1024
+
+
+class _TruncatingStringIO(StringIO):
+    def write(self, s):
+        cur = self.tell()
+        if cur >= _CAPTURE_MAX_CHARS:
+            return len(s)
+        remaining = _CAPTURE_MAX_CHARS - cur
+        if len(s) > remaining:
+            s = s[:remaining]
+        return super().write(s)
+
+
 # used to capture stdout as a list
 # from https://stackoverflow.com/a/16571630/6416660
 # alternative use redirect_stdout() from contextlib
 class Capturing(list):
     def __enter__(self):
         self._stdout = sys.stdout
-        sys.stdout = self._stringio = StringIO()
+        sys.stdout = self._stringio = _TruncatingStringIO()
         # Make closing the StringIO a no-op
         self._stringio.close = lambda x: 1
         return self
@@ -432,8 +447,9 @@ def run_test(sample, test=None, debug=False, timeout=6):
     signal.signal(signal.SIGALRM, timeout_handler)
 
     # Disable functionalities that can make destructive changes to the test.
-    # max memory is set to 4GB
-    reliability_guard()
+    # Cap per-candidate RSS at 1 GiB so a runaway allocation gets killed by the
+    # kernel before it can OOM the host (see PreciseCoder job 2307285 autopsy).
+    reliability_guard(maximum_memory_bytes=1 * 1024**3)
 
     if debug:
         print(f"start = {datetime.now().time()}")
