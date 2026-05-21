@@ -131,11 +131,14 @@ class LiveCodeBenchHandler(DatasetHandler):
 
         return fail_ids, correct_ids, ""
 
-    def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20, timeout=1800):
+    def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20,
+                              timeout=1800, compact_feedback=False):
         """Shape the JSON request that the LCB persistent worker expects.
 
         LCB ignores gt_file (LCB.save_formatted_gt returns None). The map_file
         sidecar is built alongside verify_file by build_verify_unit_test().
+        compact_feedback is accepted for API symmetry with BCB but unused —
+        LCB.parse_worker_response always returns "" for fail_feedback.
         See PDB/dataset/livecodebench/install/worker_loop.py for the receiving end.
         """
         verify_path = Path(verify_file)
