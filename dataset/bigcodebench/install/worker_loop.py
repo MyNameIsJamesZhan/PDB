@@ -286,11 +286,11 @@ def _handle_score_pool(req: dict) -> dict:
         except FileNotFoundError:
             pass
 
-    # Defaults from bigcodebench.evaluate.evaluate signature. We never
-    # ran with custom values, so hard-code them. calibrated=True matches
-    # the legacy handler path (handler.py never passes --calibrated).
-    max_as_limit = 30 * 1024
-    max_data_limit = 30 * 1024
+    # Upstream's default of 30 GB per candidate × 8 pool workers can OOM the
+    # node when an adversarial candidate allocates aggressively. Cap at 4 GiB
+    # — comfortably above any real BCB task's working set, but bounded.
+    max_as_limit = 4 * 1024
+    max_data_limit = 4 * 1024
     max_stack_limit = 10
     min_time_limit = 10.0
     # no_gt=True branch in evaluate.py:383 falls back to gt_time_limit=20.

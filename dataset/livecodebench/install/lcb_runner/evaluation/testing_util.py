@@ -447,9 +447,10 @@ def run_test(sample, test=None, debug=False, timeout=6):
     signal.signal(signal.SIGALRM, timeout_handler)
 
     # Disable functionalities that can make destructive changes to the test.
-    # Cap per-candidate RSS at 1 GiB so a runaway allocation gets killed by the
+    # Cap per-candidate RSS at 4 GiB so a runaway allocation gets killed by the
     # kernel before it can OOM the host (see PreciseCoder job 2307285 autopsy).
-    reliability_guard(maximum_memory_bytes=1 * 1024**3)
+    # Matches the BCB worker's per-candidate limit for symmetry.
+    reliability_guard(maximum_memory_bytes=4 * 1024**3)
 
     if debug:
         print(f"start = {datetime.now().time()}")
