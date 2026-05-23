@@ -92,8 +92,8 @@ _POOL: ProcessPoolExecutor | None = None
 _POOL_FLUSH_COUNTER = 0
 _POOL_RECYCLE_EVERY = int(os.environ.get("PDB_LCB_POOL_RECYCLE_EVERY", "50"))
 # Per-candidate timeout passed to evaluate_generations_by_problem.
-# Matches the legacy _make_args(timeout=6).
-_DEFAULT_TIMEOUT = 6
+# Overridable via PDB_LCB_TIMEOUT to allow A/B comparison at runtime.
+_DEFAULT_TIMEOUT = int(os.environ.get("PDB_LCB_TIMEOUT", "3"))
 
 
 def _pool_child_init() -> None:
@@ -171,7 +171,7 @@ def _make_args(custom_output_file: str | None = None) -> argparse.Namespace:
         custom_output_file=custom_output_file,
         custom_output_save_name=None,
         num_process_evaluate=12,
-        timeout=6,
+        timeout=_DEFAULT_TIMEOUT,
     )
 
 
