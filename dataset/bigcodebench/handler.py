@@ -15,7 +15,13 @@ class BigCodeBenchHandler(DatasetHandler):
     and test suites. Evaluation runs via the `bigcodebench.evaluate` CLI tool.
     """
 
-    GT_DATA_PATH = "dataset/bigcodebench/data/full_data.json"
+    # Resolved relative to this file so consumers don't need to chdir to the
+    # PDB repo root before invoking the handler. Override via env var if the
+    # data lives elsewhere (e.g., a downstream training repo with its own layout).
+    GT_DATA_PATH = os.environ.get(
+        "BCB_FULL_DATA_PATH",
+        str(Path(__file__).parent / "data" / "full_data.json"),
+    )
 
     def preprocess(self, raw_data):
         """
@@ -125,6 +131,46 @@ class BigCodeBenchHandler(DatasetHandler):
             return fail_ids, correct_ids, fail_feedback
         else:
             raise FileNotFoundError(f"Cannot locate evaluation results for {base_name}")
+
+    def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20,
+                              timeout=1800, compact_feedback=False):
+        """Shape the JSON request that the BCB persistent worker expects.
+
+        The wire format passes verify_file + gt_file PATHS (not contents) —
+        the manager has already written them via build_verify_unit_test +
+        save_formatted_gt, and the worker reads them off the shared filesystem.
+        Mirrors verify_unit_test()'s gt_file requirement: BCB always needs a
+        gt_file because eval depends on the canonical task metadata.
+
+        compact_feedback=True drops per-test traceback / stdout / stderr from
+        fail_feedback (keeps the field as empty strings for protocol compat).
+        Caller should set this in the RL reward path — the details are never
+        read there, and emitting them can push the JSON response past
+        asyncio's 64 KiB StreamReader limit and corrupt the flush.
+
+        See PDB/dataset/bigcodebench/install/worker_loop.py for the receiving end.
+        """
+        if gt_file is None:
+            raise ValueError("BCB worker requires gt_file (build via save_formatted_gt)")
+        if Path(verify_file).parent != Path(gt_file).parent:
+            raise ValueError(
+                f"verify_file and gt_file must share a parent directory; "
+                f"got {Path(verify_file).parent} vs {Path(gt_file).parent}"
+            )
+        return {
+            "op": "score",
+            "verify_file": str(verify_file),
+            "gt_file": str(gt_file),
+            "timeout_per_task": timeout_per_task,
+            "compact_feedback": compact_feedback,
+        }
+
+    def parse_worker_response(self, resp):
+        """Unpack the worker's score response into (fail_ids, correct_ids, fail_feedback).
+
+        Identical shape to verify_unit_test() so callers can swap the two.
+        """
+        return resp["fail_ids"], resp["correct_ids"], resp["fail_feedback"]
 
     def build_verify_unit_test(self, log_file_prefix, results, sol_field="solution"):
         """

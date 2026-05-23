@@ -63,6 +63,37 @@ class DatasetHandler(ABC):
             )
         return [str(self.venv_python), "-m", module, *args]
 
+    @property
+    def worker_script(self) -> Path:
+        """Default path to this dataset's persistent worker_loop.py.
+
+        Override on a subclass if you keep the worker script somewhere other
+        than ``<install_dir>/worker_loop.py``.
+        """
+        return self.install_dir / "worker_loop.py"
+
+    def spawn_worker_cmd(self) -> list[str]:
+        """Command to spawn this dataset's persistent evaluator worker.
+
+        The worker is a long-lived ``<venv>/bin/python worker_loop.py`` process
+        that pre-loads the dataset once and answers per-step ``score`` requests
+        on stdin/stdout (JSON lines, one per request). See
+        ``rllm/rewards/eval_workers/worker.py`` in the PreciseCoder repo for
+        the manager-side wrapper, and the per-dataset ``worker_loop.py`` for
+        the wire format.
+        """
+        if not self.worker_script.exists():
+            raise RuntimeError(
+                f"worker_loop.py missing at {self.worker_script}. "
+                f"This dataset hasn't been wired for persistent workers yet."
+            )
+        if not self.venv_python.exists():
+            raise RuntimeError(
+                f"uv venv missing at {self.venv_python}. "
+                f"Run `cd {self.install_dir} && uv sync`."
+            )
+        return [str(self.venv_python), str(self.worker_script)]
+
     def mark_editable_lines(self, data):
         """
         Compute which lines in each code snippet are editable and deletable.

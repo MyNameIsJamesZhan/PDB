@@ -191,8 +191,14 @@ def evaluate(
     max_stack_limit: int = 10,
     check_gt_only: bool = False,
     no_gt: bool = False,
+    problems: Optional[dict] = None,
     **model_kwargs,
-):  
+):
+    # NOTE: `problems` is a pre-loaded BCB dataset. When None (default / CLI
+    # path) we call get_bigcodebench(subset=subset) below as before. When
+    # provided, the load is skipped — used by the persistent reward worker
+    # (see PDB/dataset/bigcodebench/install/worker_loop.py) so the ~30s
+    # dataset cold start is paid once per training job, not per step.
     if not samples and model_kwargs:
         samples = run_codegen(
             split=split,
@@ -294,8 +300,9 @@ def evaluate(
             samples = "__dummy__.jsonl"
 
         # breakpoint()
-        problems = get_bigcodebench(subset=subset)
-        
+        if problems is None:
+            problems = get_bigcodebench(subset=subset)
+
         # Add selective evaluation logic
         if selected_ids:
             problems = {k: v for k, v in problems.items() if k in selected_ids}
