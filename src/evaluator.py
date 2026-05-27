@@ -548,6 +548,8 @@ class Evaluator:
         #   where tolerance credit accounts for the essential edit size found
         #   by the deep redundancy check.
         for task_id, gt_diff, pred_diff in zip(self.eval_ids, self.gt_diff, self.pred_diff):
+            edit_line = len(pred_diff)
+            edit_blocks = len(parse_diff_to_blocks(pred_diff)) if pred_diff else 0
 
             if not gt_diff:
                 raise ValueError(f"Ground truth empty for {task_id}")
@@ -599,6 +601,8 @@ class Evaluator:
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
+                "edit_line": edit_line,
+                "edit_blocks": edit_blocks,
                 "matched_blocks": matched_blocks[task_id],
                 "unmatched_pred": unmatched_pred[task_id],
                 "unmatched_gt": unmatched_gt[task_id]
@@ -636,8 +640,11 @@ class Evaluator:
         p = sum(v["precision"] for v in sym.values())
         r = sum(v["recall"]    for v in sym.values())
         f = sum(v["f1"]        for v in sym.values())
+        el = sum(v.get("edit_line", 0)   for v in sym.values())
+        eb = sum(v.get("edit_blocks", 0) for v in sym.values())
         print(f"[summary] {self.model_name} on {self.eval_set_name} round {self.round}: "
-              f"unit={u/n:.3f} prec={p/n:.3f} rec={r/n:.3f} f1={f/n:.3f} (n={n})")
+              f"unit={u/n:.3f} prec={p/n:.3f} rec={r/n:.3f} f1={f/n:.3f} "
+              f"eline={el/n:.2f} eblk={eb/n:.2f} (n={n})")
 
 
 if __name__ == "__main__":

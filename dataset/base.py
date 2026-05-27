@@ -1,4 +1,5 @@
 import inspect
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import ClassVar
@@ -45,8 +46,16 @@ class DatasetHandler(ABC):
 
     @property
     def venv_python(self) -> Path:
-        """Python interpreter inside the dataset's uv-managed .venv."""
-        return self.install_dir / ".venv" / "bin" / "python"
+        """Python interpreter inside the dataset's uv-managed venv.
+
+        The venv directory name defaults to ``.venv`` but can be overridden via
+        ``$PDB_VENV_NAME`` so that architecture-specific venvs can coexist at the
+        same (shared-filesystem) install path — e.g. ``.venv`` for DeltaAI/aarch64
+        and ``.venv-x86`` for Delta/x86_64. Build the matching venv with
+        ``UV_PROJECT_ENVIRONMENT=$PDB_VENV_NAME uv sync``.
+        """
+        venv_name = os.environ.get("PDB_VENV_NAME", ".venv")
+        return self.install_dir / venv_name / "bin" / "python"
 
     def venv_cmd(self, module: str, *args: str) -> list[str]:
         """
