@@ -26,6 +26,16 @@ from config import DEFAULT_TOLERANCE_MULTILINE, DEFAULT_TOLERANCE_SINGLELINE, EV
 from collections import defaultdict
 from argparse import ArgumentParser
 
+# Symbolic-scoring cost guard. A precise fix edits a handful of lines, so a
+# predicted diff far larger than the GT diff cannot be precise (e.g. an RL
+# policy collapsing into long degenerate output). Such a prediction explodes
+# the Pass-2 block matching and the semantic/redundancy unit-test fan-out — the
+# un-bounded memory/time path that OOM'd training. When
+# len(pred_diff) > MULT * len(gt_diff) + PLUS we skip matching and score
+# precision=recall=f1=0 (unit score is computed separately and unaffected).
+PRED_DIFF_GUARD_MULT = int(os.environ.get("PDB_MAX_PRED_DIFF_MULT", "2"))
+PRED_DIFF_GUARD_PLUS = int(os.environ.get("PDB_MAX_PRED_DIFF_PLUS", "3"))
+
 
 class Evaluator:
     def __init__(self, args, results=None):
@@ -42,6 +52,12 @@ class Evaluator:
         # lines for full precision credit. Default: 1 for multiline mode,
         # 2 for single-line mode.
         self.tolerance = args.tolerance
+        # Pred-diff guard switch. ON: predictions far larger than GT are skipped
+        # and scored 0/0/0 (protects the RL reward from being gamed by, and the
+        # block matcher from OOMing on, degenerate huge rewrites). OFF: every
+        # prediction is scored on its merits. Default OFF so the evaluator
+        # measures faithfully; the training reward path opts IN explicitly.
+        self.pred_diff_guard = getattr(args, "pred_diff_guard", False)
         self.round = 0
         assert self.tolerance >= 0, "tolerance must be >= 0"
         self.gt, self.buggy_code, self.pred, self.gt_diff, self.pred_diff, self.eval_ids, self.eval_results = [], [], [], [], [], [], []
@@ -273,6 +289,9 @@ class Evaluator:
         all_buggy = {task_id: buggy for task_id, buggy in zip(self.eval_ids, self.buggy_code)}
 
         for task_id, gt_diff, pred_diff in zip(self.eval_ids, self.gt_diff, self.pred_diff):
+            # Skip pathological over-edits (guard on only); scored 0/0/0.
+            if self.pred_diff_guard and len(pred_diff) > PRED_DIFF_GUARD_MULT * len(gt_diff) + PRED_DIFF_GUARD_PLUS:
+                continue
             remain_gt_diff = copy.deepcopy(gt_diff)
             remain_pred_diff = copy.deepcopy(pred_diff)
             remain_gt_blocks = parse_diff_to_blocks(remain_gt_diff)[::-1]
@@ -637,6 +656,9 @@ if __name__ == "__main__":
                              f"block for full precision credit. 0=strict. If unset, defaults to "
                              f"{DEFAULT_TOLERANCE_SINGLELINE} in --mode single and "
                              f"{DEFAULT_TOLERANCE_MULTILINE} in --mode multi.")
+    parser.add_argument("--pred_diff_guard", action=argparse.BooleanOptionalAction, default=False,
+                        help="Skip scoring predictions far larger than GT (0/0/0). Default off "
+                             "(faithful eval); the RL reward path turns it on to protect the reward.")
     parser.add_argument("--max_iter", type=int, default=1, help="Maximum number of add-bug iterations")
     parser.add_argument("--reload_first_round", action="store_true", help="Whether to reload first round results")
     parser.add_argument("--reload_result_file", type=str, default=1, help="The result file to reload")

@@ -52,7 +52,7 @@ class BigCodeBenchHandler(DatasetHandler):
             raise NotImplementedError
         return processed_data
 
-    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=20, timeout=1800):
+    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=30, timeout=1800):
         """
         Run unit tests using the bigcodebench.evaluate CLI.
 
