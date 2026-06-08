@@ -616,6 +616,208 @@ class Evaluator:
 
         return "Precision", avg_precision, "Recall", avg_recall, "F1", avg_f1
 
+    def _extract_pr_components(self, gt_diff, pred_diff, matched_blocks_entry):
+        """
+        Extract raw P/R numerators and denominators for one file evaluation.
+
+        Returns a dict with:
+            precision_num   = matched_gt_lines + tolerance
+            precision_denom = predicted_pos_lines
+            recall_num      = true_pos_blocks
+            recall_denom    = actual_pos_blocks
+        """
+        gt_blocks = parse_diff_to_blocks(gt_diff)
+        actual_pos_blocks = len(gt_blocks)
+        predicted_pos_lines = len(pred_diff)
+        tolerance = sum(m["tolerance"] for _, m in matched_blocks_entry.items())
+
+        matched_gt_block_ids = set()
+        matched_gt_lines = 0
+        for _, match in matched_blocks_entry.items():
+            if match.get("success", True) and match.get("gt_match_count", 0) > 0:
+                if "gt_blocks" in match:
+                    for gb in match["gt_blocks"]:
+                        matched_gt_block_ids.add(gb["block_id"])
+                        matched_gt_lines += len(gb["diff"])
+                else:
+                    em_line = match["block_start"]
+                    for gb in gt_blocks:
+                        if gb["block_start"] <= em_line <= gb["block_end"]:
+                            matched_gt_block_ids.add(gb["block_id"])
+                            break
+                    matched_gt_lines += len(match.get("diff", {})) or 1
+
+        return {
+            "precision_num": matched_gt_lines + tolerance,
+            "precision_denom": predicted_pos_lines,
+            "recall_num": len(matched_gt_block_ids),
+            "recall_denom": actual_pos_blocks,
+        }
+
+    def run_cross_file_evaluation(self, results, round=None):
+        """
+        Score cross-file instances. P/R is micro-averaged across files per instance;
+        unit score is 1 iff all files pass their tests.
+        """
+        if round:
+            self.round = round
+        elif results:
+            self.round = results[0].get("round", 1)
+
+        cross_file_scores = {"Unit score": {}, "Symbolic block scores": {}}
+
+        # ---- symbolic block scores (no Docker needed) ----
+        for item in results:
+            task_id = item["task_id"]
+            files = item.get("files", [])
+            file_results = item.get("debug_results", {}).get("file_results", [])
+
+            if not file_results:
+                cross_file_scores["Symbolic block scores"][task_id] = {
+                    "precision": 0.0, "recall": 0.0, "f1": 0.0,
+                    "note": "no model output"
+                }
+                continue
+
+            sum_p_num = sum_p_denom = sum_r_num = sum_r_denom = 0
+            per_file_details = []
+            for file_item, fr in zip(files, file_results):
+                gt_diff = file_item.get("gt_diff", {})
+                pred_diff = fr.get("pred_diff", {})
+
+                if not gt_diff:
+                    continue
+
+                # Pass-1 exact match only (no Docker needed for structural scoring).
+                tmp_args = copy.copy(self)
+                from collections import defaultdict as _dd
+                mb = _dd(dict)
+                gt_blocks = parse_diff_to_blocks(gt_diff)
+                pred_blocks = parse_diff_to_blocks(pred_diff)
+                em_count = 0
+                matched_gt_set = set()
+                for pb in pred_blocks:
+                    for gb in gt_blocks:
+                        if (pb["block_start"] == gb["block_start"]
+                                and pb["block_end"] == gb["block_end"]
+                                and len(pb["diff"]) == len(gb["diff"])
+                                and all(
+                                    k in gb["diff"]
+                                    and pb["diff"][k]["original"] == gb["diff"][k]["original"]
+                                    and pb["diff"][k]["modified"] == gb["diff"][k]["modified"]
+                                    for k in pb["diff"]
+                                )):
+                            if gb["block_id"] not in matched_gt_set:
+                                matched_gt_set.add(gb["block_id"])
+                                key = f"{task_id}_em_{em_count}"
+                                mb[task_id][key] = {
+                                    "block_start": pb["block_start"],
+                                    "block_end": pb["block_end"],
+                                    "diff": dict(pb["diff"]),
+                                    "block_id": gb["block_id"],
+                                    "success": True,
+                                    "gt_match_count": 1,
+                                    "tolerance": 0,
+                                }
+                                em_count += 1
+                            break
+
+                comps = self._extract_pr_components(gt_diff, pred_diff, mb[task_id])
+                sum_p_num   += comps["precision_num"]
+                sum_p_denom += comps["precision_denom"]
+                sum_r_num   += comps["recall_num"]
+                sum_r_denom += comps["recall_denom"]
+                per_file_details.append({
+                    "target_file": file_item["target_file"],
+                    **comps,
+                })
+
+            precision = min(sum_p_num / sum_p_denom, 1.0) if sum_p_denom > 0 else 0.0
+            recall    = min(sum_r_num / sum_r_denom, 1.0) if sum_r_denom > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+
+            cross_file_scores["Symbolic block scores"][task_id] = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "per_file": per_file_details,
+                "sums": {
+                    "precision_num": sum_p_num,
+                    "precision_denom": sum_p_denom,
+                    "recall_num": sum_r_num,
+                    "recall_denom": sum_r_denom,
+                },
+            }
+
+        # ---- unit score ----
+        verify_entries = []
+        for item in results:
+            task_id = item["task_id"]
+            files = item.get("files", [])
+            file_results = item.get("debug_results", {}).get("file_results", [])
+            for file_item, fr in zip(files, file_results):
+                sub_id = f"{task_id}__file__{file_item['target_file'].replace('/', '_')}"
+                verify_entries.append({
+                    "task_id": sub_id,
+                    "cross_parent": task_id,
+                    "solution": fr.get("solution", ""),
+                    "buggy_code": file_item.get("buggy_code", ""),
+                    "gt_solution": file_item.get("gt_solution", ""),
+                    "target_file": file_item.get("target_file", "solution.py"),
+                    "repo": item.get("repo", ""),
+                    "image_name": item.get("image_name", ""),
+                    "FAIL_TO_PASS": file_item.get("FAIL_TO_PASS", []),
+                    "PASS_TO_PASS": file_item.get("PASS_TO_PASS", []),
+                })
+
+        if verify_entries:
+            import json as _json
+            from pathlib import Path as _Path
+            cross_verify_file = self.log_dir + f"/{self.model_name}_cross_fix_verify.jsonl"
+            _Path(cross_verify_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(cross_verify_file, "w") as _f:
+                for _e in verify_entries:
+                    _f.write(_json.dumps(_e) + "\n")
+            fail_ids, correct_ids, _ = self.handler.verify_cross_fix(
+                cross_verify_file, timeout=1800)
+            correct_set = set(correct_ids)
+
+            # Instance passes only if ALL its file sub-entries pass
+            for item in results:
+                task_id = item["task_id"]
+                files = item.get("files", [])
+                file_results = item.get("debug_results", {}).get("file_results", [])
+                all_pass = all(
+                    f"{task_id}__file__{fi['target_file'].replace('/', '_')}" in correct_set
+                    for fi in files
+                )
+                cross_file_scores["Unit score"][task_id] = 1 if all_pass else 0
+        else:
+            for item in results:
+                cross_file_scores["Unit score"][item["task_id"]] = 0
+
+        self.scores = cross_file_scores
+        self.results = results
+        self.round = round or 1
+
+        # Print summary
+        n = len(results)
+        if n > 0:
+            sym = cross_file_scores["Symbolic block scores"]
+            unit = cross_file_scores["Unit score"]
+            avg_p = sum(v["precision"] for v in sym.values()) / n
+            avg_r = sum(v["recall"] for v in sym.values()) / n
+            avg_f = sum(v["f1"] for v in sym.values()) / n
+            avg_u = sum(unit.values()) / n
+            print(f"[cross-file summary] unit={avg_u:.3f} prec={avg_p:.3f} "
+                  f"rec={avg_r:.3f} f1={avg_f:.3f} (n={n})")
+
+        save_file = self.output_dir + f"/{self.model_name}_on_{self.eval_set_name}_cross_round_{self.round}_scores.json"
+        with open(save_file, "w") as f:
+            json.dump(cross_file_scores, f, indent=2)
+        print(f"Cross-file scores saved to {save_file}")
+        return cross_file_scores
+
     def save_results(self):
         save_file = self.output_dir + f"/{self.model_name}_on_{self.eval_set_name}_round_{self.round}_scores.json"
         print(f"Saving results to {save_file}")
