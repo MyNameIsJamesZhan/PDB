@@ -11,6 +11,8 @@ Mode is inferred from arguments:
 """
 import difflib
 import json
+import os
+import platform
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +34,40 @@ _INSTALL_MSG = (
     f"Ensure {_INSTALL_DIR}/SWE-smith and {_INSTALL_DIR}/SWE-bench exist "
     "(see dataset/swesmith/install/README.md)"
 )
+
+# Container backend selector. Real unit-test scoring runs the repo's tests
+# inside a per-instance image: `docker` (x86 with Docker) or `apptainer`
+# (Delta x86, the only container runtime there). `none` => structural-only,
+# in which case the evaluator must not reach the verify_* paths at all.
+_DEFAULT_BACKEND = "apptainer"
+
+
+def _container_backend() -> str:
+    return os.environ.get("PDB_SWE_BACKEND", _DEFAULT_BACKEND).strip().lower()
+
+
+def _require_container_backend() -> str:
+    """Guard before any container-scored verification.
+
+    The SWE-smith images are x86-64 only, so container scoring must run on
+    Delta (x86), never DeltaAI/ARM. Raises a clear, actionable error when the
+    backend is missing or the architecture is incompatible.
+    """
+    backend = _container_backend()
+    if backend in ("", "none"):
+        raise RuntimeError(
+            "SWE-smith unit-test scoring needs a container backend, but "
+            "PDB_SWE_BACKEND=none (structural-only). Set PDB_SWE_BACKEND="
+            "apptainer (Delta x86) or docker, or run the evaluator's "
+            "structural-only path which skips unit scoring."
+        )
+    if platform.machine().lower() in ("aarch64", "arm64") and backend in ("apptainer", "docker"):
+        raise RuntimeError(
+            "SWE-smith container scoring must run on Delta (x86-64); the "
+            f"current host is {platform.machine()}. Run scoring on Delta, or "
+            "set PDB_SWE_BACKEND=none for structural-only on ARM."
+        )
+    return backend
 
 
 def _compute_fix_patch(buggy_code: str, corrected_code: str, file_path: str) -> str:
@@ -245,6 +281,7 @@ class SWESmithHandler(DatasetHandler):
         `bug_generation.py` path, so the bug-gen branch in this handler is
         intentionally not exercised from `verify_unit_test`.
         """
+        _require_container_backend()
         entries = [json.loads(l) for l in open(verify_file) if l.strip()]
         return self._verify_fix_eval(entries, timeout, ckpt_prefix=verify_file)
 
@@ -252,6 +289,7 @@ class SWESmithHandler(DatasetHandler):
         self, verify_file: str, timeout: int = 1800
     ) -> tuple[list[str], list[str], dict[str, str]]:
         """Public entry point for cross-file fix evaluation."""
+        _require_container_backend()
         entries = [json.loads(l) for l in open(verify_file) if l.strip()]
         return self._verify_cross_fix_eval(entries, timeout)
 
@@ -397,6 +435,7 @@ class SWESmithHandler(DatasetHandler):
         correct_ids → buggy code passes tests (invalid or trivially fixable)
         Dropped entries (Docker error) appear in neither list.
         """
+        _require_container_backend()
         try:
             from swesmith.harness.valid import run_validation
             from swesmith.harness.utils import run_patch_in_container

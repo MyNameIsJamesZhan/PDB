@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import json
 import copy
+import argparse
 
 from dataset import get_handler
 from utils import file_diff, parse_diff_to_blocks, verify_block_single_diff, verify_block_diff, expand_blocks_to_diff, rstrip_lines, \
@@ -66,6 +67,16 @@ class Evaluator:
             "Unit score": self.unit_score,
             "Symbolic block scores": self.symbolic_block_score,
         }
+        # SWE-smith scores unit tests inside per-instance containers (Docker on
+        # x86 / Apptainer on Delta). When no container backend is available
+        # (PDB_SWE_BACKEND unset or "none"), run structural-only: drop the Unit
+        # score metric so we never invoke the container path. Symbolic block
+        # scores still compute (exact-match precision/recall need no container).
+        if self.dataset == "swesmith" and \
+                os.environ.get("PDB_SWE_BACKEND", "none").strip().lower() in ("", "none"):
+            self.metrics.pop("Unit score", None)
+            print("[Evaluator] swesmith structural-only mode "
+                  "(PDB_SWE_BACKEND=none): skipping Unit score")
         self.scores = {metrics: {} for metrics in self.metrics}
         self.results = []
         self.error_msg = None
@@ -834,18 +845,21 @@ class Evaluator:
         """
         unit = self.scores.get("Unit score", {}) or {}
         sym = self.scores.get("Symbolic block scores", {}) or {}
-        n = len(unit)
+        # Structural-only runs (e.g. swesmith with PDB_SWE_BACKEND=none) carry
+        # no Unit score; fall back to the symbolic count so the summary still
+        # reports precision/recall and print "unit=NA".
+        n = len(unit) or len(sym)
         if n == 0:
             print(f"[summary] {self.model_name} on {self.eval_set_name} round {self.round}: (no results)")
             return
-        u = sum(unit.values())
+        unit_str = f"{sum(unit.values())/len(unit):.3f}" if unit else "NA"
         p = sum(v["precision"] for v in sym.values())
         r = sum(v["recall"]    for v in sym.values())
         f = sum(v["f1"]        for v in sym.values())
         el = sum(v.get("edit_line", 0)   for v in sym.values())
         eb = sum(v.get("edit_blocks", 0) for v in sym.values())
         print(f"[summary] {self.model_name} on {self.eval_set_name} round {self.round}: "
-              f"unit={u/n:.3f} prec={p/n:.3f} rec={r/n:.3f} f1={f/n:.3f} "
+              f"unit={unit_str} prec={p/n:.3f} rec={r/n:.3f} f1={f/n:.3f} "
               f"eline={el/n:.2f} eblk={eb/n:.2f} (n={n})")
 
 
