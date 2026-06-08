@@ -293,20 +293,44 @@ class SWESmithHandler(DatasetHandler):
         entries = [json.loads(l) for l in open(verify_file) if l.strip()]
         return self._verify_cross_fix_eval(entries, timeout)
 
+    def _resolve_run_patch(self):
+        """Select the container exec backend and return its run_patch_in_container.
+
+        For PDB_SWE_BACKEND=apptainer we also rebind
+        ``swesmith.harness.valid.run_patch_in_container`` so the unchanged
+        ``run_validation`` routes through Apptainer. For docker we return the
+        vendored implementation untouched. Raises on `none`/ARM via the guard.
+        """
+        backend = _require_container_backend()
+        from swesmith.harness.utils import run_patch_in_container as _docker_impl
+        if backend == "apptainer":
+            from dataset.swesmith.exec_backend import apptainer_run_patch_in_container as _impl
+            import swesmith.harness.valid as _valid
+            _valid.run_patch_in_container = _impl
+            return _impl
+        return _docker_impl
+
     def _verify_fix_eval(
         self, entries: list[dict], timeout: int, ckpt_prefix: str = ""
     ) -> tuple[list[str], list[str], dict[str, str]]:
         """Apply GT→model patch via run_validation; status "0_f2p" → correct."""
         try:
             from swesmith.harness.valid import run_validation
-            from swesmith.constants import KEY_PATCH
+            from swesmith.harness.utils import run_patch_in_container
+            from swesmith.constants import KEY_PATCH, REF_SUFFIX, LOG_DIR_RUN_VALIDATION
             from swesmith.profiles import registry
             from swebench.harness.constants import KEY_INSTANCE_ID
+            from swebench.harness.docker_build import close_logger
         except ImportError as e:
             raise ImportError(f"swesmith/swebench not importable: {e}\n{_INSTALL_MSG}") from e
 
+        run_patch_in_container = self._resolve_run_patch()
         repos = {e.get("repo", "") for e in entries if e.get("repo")}
         _set_arch(repos, registry)
+        # Establish the clean (gold) baseline per repo so get_valid_report has a
+        # reference to diff against; without it every instance would score 0_f2p.
+        _run_pregold(repos, registry, run_patch_in_container,
+                     KEY_INSTANCE_ID, REF_SUFFIX, LOG_DIR_RUN_VALIDATION, close_logger)
 
         ckpt_file = Path(ckpt_prefix + "_fix_eval_ckpt.json") if ckpt_prefix else Path("/tmp/fix_eval_ckpt.json")
         ckpt: dict = {}
@@ -384,6 +408,7 @@ class SWESmithHandler(DatasetHandler):
         except ImportError as e:
             raise ImportError(f"swesmith/swebench not importable: {e}\n{_INSTALL_MSG}") from e
 
+        run_patch_in_container = self._resolve_run_patch()
         repos = {e.get("repo", "") for e in entries if e.get("repo")}
         _set_arch(repos, registry)
         _run_pregold(repos, registry, run_patch_in_container,
@@ -446,6 +471,7 @@ class SWESmithHandler(DatasetHandler):
         except ImportError as e:
             raise ImportError(f"swesmith/swebench not importable: {e}\n{_INSTALL_MSG}") from e
 
+        run_patch_in_container = self._resolve_run_patch()
         repos = {e.get("repo", "") for e in entries if e.get("repo")}
         _set_arch(repos, registry)
         _run_pregold(repos, registry, run_patch_in_container,
