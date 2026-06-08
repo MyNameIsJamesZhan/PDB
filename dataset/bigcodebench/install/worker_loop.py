@@ -52,7 +52,7 @@ import sys
 import time
 import traceback
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -111,6 +111,12 @@ _POOL: ProcessPoolExecutor | None = None
 # mitigate heap fragmentation.
 _POOL_FLUSH_COUNTER = 0
 _POOL_RECYCLE_EVERY = int(os.environ.get("PDB_BCB_POOL_RECYCLE_EVERY", "50"))
+# Stall watchdog: if no candidate future completes within this many seconds
+# while work is still pending, treat the pool as wedged (a sandbox grandchild
+# deadlocked outside its per-task timeout) and recycle it instead of blocking
+# the training step indefinitely. BCB per-task budget is ~20s, so the window is
+# wider than LCB's; healthy flushes still complete a future every few seconds.
+_POOL_STALL_S = float(os.environ.get("PDB_BCB_POOL_STALL_S", "180"))
 
 
 def _make_pool() -> ProcessPoolExecutor:
@@ -170,6 +176,30 @@ def _shutdown_pool() -> None:
         except Exception:
             pass
         _POOL = None
+
+
+def _force_recycle_pool() -> None:
+    """Drop a wedged pool and SIGKILL its workers so the next flush rebuilds.
+    Used when the stall watchdog fires: shutdown(wait=False) won't stop a
+    worker stuck on an unkillable sandbox grandchild, so we kill the worker
+    procs directly. Stragglers reparent and die on their own timeout — a
+    transient leak, not a hang."""
+    global _POOL, _POOL_FLUSH_COUNTER
+    pool = _POOL
+    _POOL = None
+    _POOL_FLUSH_COUNTER = 0
+    if pool is None:
+        return
+    procs = list(getattr(pool, "_processes", {}).values())
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
 atexit.register(_shutdown_pool)
@@ -303,7 +333,7 @@ def _handle_score_pool(req: dict) -> dict:
     t0 = time.monotonic()
 
     completion_id: Counter[str] = Counter()
-    futures = []
+    futures: dict = {}
     # Re-mirror evaluate.py's solution-assembly logic exactly so behavior
     # is byte-identical to the legacy path (see evaluate.py:363-384).
     with _stdout_to_stderr():
@@ -317,8 +347,9 @@ def _handle_score_pool(req: dict) -> dict:
                 solution = problems_subset[tid]["complete_prompt"] + sample["completion"]
             # calibrated=True default — see evaluate.py:368-369.
             solution = problems_subset[tid]["code_prompt"] + "\n    pass\n" + solution
+            cid = completion_id[tid]
             args = (
-                completion_id[tid],
+                cid,
                 problems_subset[tid],
                 solution,
                 max_as_limit,
@@ -329,14 +360,44 @@ def _handle_score_pool(req: dict) -> dict:
                 gt_time_limit,
                 timeout_per_task,
             )
-            futures.append(pool.submit(_local_check_correctness, *args))
+            fut = pool.submit(_local_check_correctness, *args)
+            # Keep enough to fabricate a failure result if this future wedges.
+            futures[fut] = {
+                "completion_id": cid,
+                "task_id": tid,
+                "_identifier": sample["_identifier"],
+                "solution": solution,
+            }
             completion_id[tid] += 1
     t_submit = time.monotonic()
 
     eval_results: dict[str, list[dict]] = defaultdict(list)
-    for fut in as_completed(futures):
-        r = fut.result()
-        eval_results[r["task_id"]].append(r)
+    pending = set(futures)
+    wedged = False
+    while pending:
+        done, pending = wait(pending, timeout=_POOL_STALL_S,
+                             return_when=FIRST_COMPLETED)
+        if not done:
+            wedged = True
+            break
+        for fut in done:
+            r = fut.result()
+            eval_results[r["task_id"]].append(r)
+    if wedged:
+        print(f"[bcb_worker] POOL STALL: no progress for {_POOL_STALL_S:.0f}s "
+              f"with {len(pending)}/{len(futures)} futures pending — failing "
+              f"stragglers and recycling pool", file=sys.stderr, flush=True)
+        for fut in pending:
+            info = futures[fut]
+            fut.cancel()
+            eval_results[info["task_id"]].append({
+                "completion_id": info["completion_id"],
+                "task_id": info["task_id"],
+                "_identifier": info["_identifier"],
+                "solution": info["solution"],
+                "base": ("fail", "pool_stall_timeout"),
+            })
+        _force_recycle_pool()
     t_wait = time.monotonic()
 
     # Build the same {"date":..., "eval": {tid: [...]}} dict that
