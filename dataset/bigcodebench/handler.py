@@ -127,10 +127,41 @@ class BigCodeBenchHandler(DatasetHandler):
                     correct_ids.append(task_id)
                 else:
                     fail_ids.append(task_id)
-                    fail_feedback.append(json.dumps(perfs[0].get("details", ""), indent=2))
+                    fail_feedback.append(self._bcb_feedback(perfs[0].get("details")))
             return fail_ids, correct_ids, fail_feedback
         else:
             raise FileNotFoundError(f"Cannot locate evaluation results for {base_name}")
+
+    @classmethod
+    def _bcb_feedback(cls, details) -> str:
+        """Turn BCB's per-test ``{test_name: traceback}`` details into uniform
+        (input, expected, got) triples. BCB tests are unittest assertion methods,
+        so ``input`` is the test-case name and expected/got come from the
+        ``AssertionError: <got> != <expected>`` line (falling back to the raised
+        exception line for non-assertion failures)."""
+        if isinstance(details, dict) and details:
+            return cls.format_failed_cases(
+                [cls._bcb_case(name, str(trace)) for name, trace in details.items()]
+            )
+        if details:  # timeout/error with a non-dict detail blob
+            return cls.format_failed_cases([{"got": str(details)}])
+        return ""
+
+    @staticmethod
+    def _bcb_case(test_name: str, trace: str) -> dict:
+        case = {"input": test_name, "expected": None, "got": None}
+        idx = trace.find("AssertionError:")
+        if idx != -1:
+            line = trace[idx + len("AssertionError:"):].split("\n", 1)[0].strip()
+            if " != " in line:
+                got, expected = line.split(" != ", 1)
+                case["got"], case["expected"] = got.strip(), expected.strip()
+            else:
+                case["got"] = line or "AssertionError"
+        else:
+            non_empty = [ln for ln in trace.splitlines() if ln.strip()]
+            case["got"] = non_empty[-1].strip() if non_empty else "error"
+        return case
 
     def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20,
                               timeout=1800, compact_feedback=False):

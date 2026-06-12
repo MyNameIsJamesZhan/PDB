@@ -93,6 +93,24 @@ def _set_arch(repos, registry) -> None:
             pass
 
 
+def _patched_run_has_tests(report_path: Path) -> bool:
+    """Crash-pass guard: a 0_f2p verdict is only trustworthy if the patched
+    test run actually produced parsed test results. A truncated or otherwise
+    broken solution crashes pytest at collection (or the patch fails to
+    apply), the log parser yields an empty status map, every report list is
+    empty, and get_valid_report degenerates to a spurious 0_f2p."""
+    try:
+        report = json.loads(Path(report_path).read_text())
+    except Exception:
+        return False
+    if report.get("timed_out"):
+        return False
+    return any(
+        report.get(k)
+        for k in ("FAIL_TO_PASS", "PASS_TO_PASS", "FAIL_TO_FAIL", "PASS_TO_FAIL")
+    )
+
+
 def _run_pregold(repos, registry, run_patch_in_container,
                  KEY_INSTANCE_ID, REF_SUFFIX, LOG_DIR_RUN_VALIDATION, close_logger) -> None:
     """Run the clean baseline once per repo; results are cached to disk."""
@@ -319,7 +337,7 @@ class SWESmithHandler(DatasetHandler):
             from swesmith.harness.utils import run_patch_in_container
             from swesmith.constants import KEY_PATCH, REF_SUFFIX, LOG_DIR_RUN_VALIDATION
             from swesmith.profiles import registry
-            from swebench.harness.constants import KEY_INSTANCE_ID
+            from swebench.harness.constants import KEY_INSTANCE_ID, LOG_REPORT
             from swebench.harness.docker_build import close_logger
         except ImportError as e:
             raise ImportError(f"swesmith/swebench not importable: {e}\n{_INSTALL_MSG}") from e
@@ -376,6 +394,10 @@ class SWESmithHandler(DatasetHandler):
             try:
                 result = run_validation(instance)
                 status = result.get("status", "")
+                if status == "0_f2p" and not _patched_run_has_tests(
+                    LOG_DIR_RUN_VALIDATION / repo / task_id / LOG_REPORT
+                ):
+                    status = "0_f2p_no_tests_parsed"
                 if status == "0_f2p":
                     correct_ids.append(task_id)
                     ckpt[task_id] = {"status": "correct"}
@@ -397,13 +419,13 @@ class SWESmithHandler(DatasetHandler):
     def _verify_cross_fix_eval(
         self, entries: list[dict], timeout: int
     ) -> tuple[list[str], list[str], dict[str, str]]:
-        """Apply GT→model patch per file via run_validation; status != "1+_f2p" → correct."""
+        """Apply GT→model patch per file via run_validation; status "0_f2p" with parsed tests → correct."""
         try:
             from swesmith.harness.valid import run_validation
             from swesmith.harness.utils import run_patch_in_container
             from swesmith.constants import KEY_PATCH, REF_SUFFIX, LOG_DIR_RUN_VALIDATION
             from swesmith.profiles import registry
-            from swebench.harness.constants import KEY_INSTANCE_ID
+            from swebench.harness.constants import KEY_INSTANCE_ID, LOG_REPORT
             from swebench.harness.docker_build import close_logger
         except ImportError as e:
             raise ImportError(f"swesmith/swebench not importable: {e}\n{_INSTALL_MSG}") from e
@@ -439,11 +461,16 @@ class SWESmithHandler(DatasetHandler):
             instance = {KEY_INSTANCE_ID: task_id, "repo": repo, KEY_PATCH: patch}
             try:
                 result = run_validation(instance)
-                if result.get("status", "fail") != "1+_f2p":
+                status = result.get("status", "fail")
+                if status == "0_f2p" and not _patched_run_has_tests(
+                    LOG_DIR_RUN_VALIDATION / repo / task_id / LOG_REPORT
+                ):
+                    status = "0_f2p_no_tests_parsed"
+                if status == "0_f2p":
                     correct_ids.append(task_id)
                 else:
                     fail_ids.append(task_id)
-                    fail_feedback[task_id] = "status=1+_f2p"
+                    fail_feedback[task_id] = f"status={status}"
             except Exception as e:
                 fail_ids.append(task_id)
                 fail_feedback[task_id] = str(e)

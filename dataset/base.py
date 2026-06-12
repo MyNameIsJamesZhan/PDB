@@ -72,6 +72,38 @@ class DatasetHandler(ABC):
             )
         return [str(self.venv_python), "-m", module, *args]
 
+    # Cap and truncation for the run_tests failure feedback shown to the agent.
+    MAX_FAILED_CASES: ClassVar[int] = 3
+    MAX_CASE_FIELD_CHARS: ClassVar[int] = 600
+
+    @classmethod
+    def format_failed_cases(cls, cases: list[dict]) -> str:
+        """Render up to ``MAX_FAILED_CASES`` failing tests as uniform
+        ``(input, expected, got)`` triples for run_tests feedback.
+
+        Each case is a dict with optional ``input``/``expected``/``got`` keys
+        (missing keys are skipped — e.g. BCB assertion tests have no scalar
+        input, LCB runtime errors have no clean ``got``). Long fields are
+        truncated; the agent applies a final overall cap.
+        """
+        if not cases:
+            return ""
+        lines = []
+        for i, c in enumerate(cases[: cls.MAX_FAILED_CASES], 1):
+            lines.append(f"Test {i}:")
+            for label in ("input", "expected", "got"):
+                if c.get(label) is None:
+                    continue
+                val = str(c[label])
+                if len(val) > cls.MAX_CASE_FIELD_CHARS:
+                    val = val[: cls.MAX_CASE_FIELD_CHARS] + " …(truncated)"
+                val = val.replace("\n", "\n    ")
+                lines.append(f"  {label}: {val}")
+        extra = len(cases) - cls.MAX_FAILED_CASES
+        if extra > 0:
+            lines.append(f"(+{extra} more failing test(s) not shown)")
+        return "\n".join(lines)
+
     @property
     def worker_script(self) -> Path:
         """Default path to this dataset's persistent worker_loop.py.
