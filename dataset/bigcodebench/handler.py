@@ -52,7 +52,7 @@ class BigCodeBenchHandler(DatasetHandler):
             raise NotImplementedError
         return processed_data
 
-    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=30, timeout=1800):
+    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=30, timeout=1800, calibrated=True, parallel=-1):
         """
         Run unit tests using the bigcodebench.evaluate CLI.
 
@@ -95,6 +95,29 @@ class BigCodeBenchHandler(DatasetHandler):
         if selected_ids is not None:
             eval_args += ["--selective_evaluate", selected_ids]
         eval_args.append("--no_gt")
+        # calibrated=True prepends code_prompt + "pass" to each solution (BCB's
+        # completion-style default). Wrong for full-file/debug solutions — it doubles
+        # the function def. Pass calibrated=False to run the solution as-is.
+        eval_args += ["--calibrated", str(calibrated)]
+        # parallel<1 -> BCB uses cpu_count()//2 workers; with unbounded BLAS threads
+        # this oversubscribes cores and times out tasks. Set explicitly (with
+        # OMP_NUM_THREADS=1 in the env) for deterministic, timeout-free scoring.
+        if parallel and parallel > 0:
+            eval_args += ["--parallel", str(parallel)]
+
+        # Cap BLAS/OpenMP to 1 thread per worker for the scoring subprocess ONLY.
+        # The BCB harness forks cpu_count()//2 workers; with unbounded BLAS threads
+        # (numpy/sklearn/matplotlib) those oversubscribe the cores and stall tasks past
+        # the per-task wall-clock limit -> spurious `timeout`, scored as failures
+        # (observed: ~40-46% of tasks, load-dependent). Scoped via the subprocess env
+        # so training/generation threading is untouched.
+        score_env = {
+            **os.environ,
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+        }
 
         try:
             subprocess.run(
@@ -102,6 +125,7 @@ class BigCodeBenchHandler(DatasetHandler):
                 cwd=workdir,
                 check=True,
                 timeout=timeout,
+                env=score_env,
             )
         except subprocess.CalledProcessError as e:
             print("Command failed with an error.")

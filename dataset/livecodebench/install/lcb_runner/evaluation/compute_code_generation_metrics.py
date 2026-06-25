@@ -109,7 +109,7 @@ def evaluate_generations(
     samples_list: list,
     generations_list: list[list[str]],
     debug: bool = False,
-    num_process_evaluate: int = 16,
+    num_process_evaluate: int = 12,
     timeout=6,
 ):
     """We take the list of code generations and try to compile them
@@ -158,7 +158,7 @@ def codegen_metrics(
     samples_list,
     generations_list,
     k_list=[1, 5, 10, 20, 40, 50, 75, 100, 125, 150, 200, 500, 1000],
-    num_process_evaluate=16,
+    num_process_evaluate=12,
     timeout=6,
     debug=False,
 ):

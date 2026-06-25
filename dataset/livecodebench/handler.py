@@ -59,6 +59,8 @@ class LiveCodeBenchHandler(DatasetHandler):
                 "lcb_runner.runner.custom_evaluator",
                 "--custom_output_file",
                 str(Path.cwd() / verify_file),
+                "--timeout",
+                str(timeout_per_task),
             ),
             cwd=workdir,
             check=True,
@@ -199,13 +201,22 @@ class LiveCodeBenchHandler(DatasetHandler):
         """
         return resp["fail_ids"], resp["correct_ids"], ""
 
-    def build_verify_unit_test(self, log_file_prefix, results, sol_field="solution"):
+    def build_verify_unit_test(self, log_file_prefix, results, sol_field="solution",
+                               group_variants=True):
         """
         Build a JSON verification file for lcb_runner's custom evaluator.
 
         NOTE: LiveCodeBench groups multiple variants of the same problem
         by question_id. We also write a sidecar _map.json that maps each base question_id
         back to the full variant IDs, so verify_unit_test can reconstruct per-variant results.
+
+        group_variants: PDB names bug variants `<base>_<idx>` and groups them by
+        the base question_id (split on the first '_'). The raw-coding holdout
+        instead passes *real* LCB question_ids as task_ids — and Codeforces/AtCoder
+        ids legitimately contain '_' (e.g. "1873_A"). Splitting those corrupts the
+        id so lcb_runner finds no matching benchmark problem and silently scores
+        them 0. Callers whose task_ids are already real LCB question_ids must pass
+        group_variants=False so the id is used verbatim.
         """
         verify_file = log_file_prefix + ".json"
         # Group by normalized question id so multiple variants are evaluated together
@@ -215,7 +226,8 @@ class LiveCodeBenchHandler(DatasetHandler):
             code = entry.get(sol_field)
             if code is None:
                 continue
-            qid = str(entry["task_id"]).split("_", 1)[0]
+            tid = str(entry["task_id"])
+            qid = tid.split("_", 1)[0] if group_variants else tid
             grouped.setdefault(qid, [])
             grouped[qid].append(code)
             qid_to_full_ids.setdefault(qid, [])
