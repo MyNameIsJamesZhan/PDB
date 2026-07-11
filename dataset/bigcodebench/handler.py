@@ -52,7 +52,7 @@ class BigCodeBenchHandler(DatasetHandler):
             raise NotImplementedError
         return processed_data
 
-    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=30, timeout=1800, calibrated=True, parallel=-1):
+    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=60, timeout=1800, calibrated=True, parallel=-1):
         """
         Run unit tests using the bigcodebench.evaluate CLI.
 
@@ -99,11 +99,17 @@ class BigCodeBenchHandler(DatasetHandler):
         # completion-style default). Wrong for full-file/debug solutions — it doubles
         # the function def. Pass calibrated=False to run the solution as-is.
         eval_args += ["--calibrated", str(calibrated)]
-        # parallel<1 -> BCB uses cpu_count()//2 workers; with unbounded BLAS threads
-        # this oversubscribes cores and times out tasks. Set explicitly (with
-        # OMP_NUM_THREADS=1 in the env) for deterministic, timeout-free scoring.
-        if parallel and parallel > 0:
-            eval_args += ["--parallel", str(parallel)]
+        # parallel<1 -> evaluate.py hardcodes n_workers=64 (it can't see our cpuset),
+        # which with heavy libs (numpy/sklearn/matplotlib) oversubscribes the cores and
+        # times out correct-but-slow tasks -> spurious failures. Always pass an explicit
+        # bound derived from the actual cpu affinity so scoring is deterministic.
+        if not parallel or parallel < 1:
+            n_cpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 8)
+            # Cap at 8: heavy tasks (scipy/matplotlib/filesystem, e.g. base 300/313)
+            # exceed the per-task wall-clock under higher worker contention. n_cpu can
+            # report the whole node, not our cpuset, so bound conservatively.
+            parallel = max(1, min(n_cpu - 1, 8))
+        eval_args += ["--parallel", str(parallel)]
 
         # Cap BLAS/OpenMP to 1 thread per worker for the scoring subprocess ONLY.
         # The BCB harness forks cpu_count()//2 workers; with unbounded BLAS threads
