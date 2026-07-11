@@ -90,7 +90,7 @@ def run(args, *, benchmark=None):
                 custom_outputs = [
                     custom_output['pred_list']
                     for custom_output in sorted(
-                        custom_outputs, key=lambda x: int(x.id.split("_")[1])
+                        custom_outputs, key=lambda x: int(x["id"].split("_")[1])
                     )
                 ]
 

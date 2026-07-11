@@ -291,7 +291,7 @@ def evaluate(
                 selected_ids = ""
 
         if parallel < 1:
-            n_workers = max(1, multiprocessing.cpu_count() // 2)
+            n_workers = 64  # hardcoded: cpu_count() sees all node cores, not our cpuset -> oversubscription
         else:
             n_workers = parallel
 

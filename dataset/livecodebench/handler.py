@@ -59,6 +59,8 @@ class LiveCodeBenchHandler(DatasetHandler):
                 "lcb_runner.runner.custom_evaluator",
                 "--custom_output_file",
                 str(Path.cwd() / verify_file),
+                "--timeout",
+                str(timeout_per_task),
             ),
             cwd=workdir,
             check=True,
@@ -91,14 +93,21 @@ class LiveCodeBenchHandler(DatasetHandler):
         if not (isinstance(eval_data, list) and len(eval_data) > 1 and isinstance(eval_data[1], dict)):
             raise ValueError("Unexpected LiveCodeBench rich output format; missing per-index results")
         per_index = eval_data[1]
+        # eval_data[2] (metadatas) is a per-sorted-index list, each a per-candidate
+        # list holding the first failing test's detail (inputs/expected/output|error).
+        metadatas = eval_data[2] if len(eval_data) > 2 and isinstance(eval_data[2], list) else []
+
+        fail_feedback = []
 
         # LCB runner sorts the benchmark by question_id, so results are keyed by sorted index.
         sorted_qids = sorted(ordered_qids)
-        qid_to_results = {}
+        qid_to_results, qid_to_meta = {}, {}
         for idx, qid in enumerate(sorted_qids):
             key = str(idx)
             if key in per_index:
                 qid_to_results[qid] = per_index[key]
+            if idx < len(metadatas):
+                qid_to_meta[qid] = metadatas[idx]
 
         for qid in ordered_qids:
             if qid not in qid_to_results:
@@ -107,6 +116,7 @@ class LiveCodeBenchHandler(DatasetHandler):
             if not isinstance(candidate_results, list) or len(candidate_results) == 0:
                 continue
             full_ids = full_id_map.get(qid, [qid] * len(candidate_results))
+            cand_meta = qid_to_meta.get(qid) or []
             num_to_map = min(len(candidate_results), len(full_ids))
             for j in range(num_to_map):
                 tests = candidate_results[j]
@@ -123,13 +133,45 @@ class LiveCodeBenchHandler(DatasetHandler):
                 else:
                     passed = False
 
-                (correct_ids if passed else fail_ids).append(full_ids[j])
+                if passed:
+                    correct_ids.append(full_ids[j])
+                else:
+                    fail_ids.append(full_ids[j])
+                    meta = cand_meta[j] if j < len(cand_meta) else None
+                    fail_feedback.append(self._lcb_feedback(meta))
 
             if len(full_ids) > num_to_map:
                 for j in range(num_to_map, len(full_ids)):
                     fail_ids.append(full_ids[j])
+                    fail_feedback.append("")
 
-        return fail_ids, correct_ids, ""
+        return fail_ids, correct_ids, fail_feedback
+
+    @classmethod
+    def _lcb_feedback(cls, meta) -> str:
+        """Turn one candidate's LCB failure metadata into an (input, expected,
+        got) feedback string. LCB records only the first failing test."""
+        if isinstance(meta, list):
+            meta = meta[0] if meta else None
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (ValueError, TypeError):
+                return ""
+        if not isinstance(meta, dict):
+            return ""
+        output = meta.get("output")
+        if output in (None, "None", ""):
+            err = meta.get("error_message") or meta.get("error") or "no output"
+            detail = meta.get("error")
+            got = f"{err} ({detail})" if detail and detail != err else str(err)
+        else:
+            got = output
+        return cls.format_failed_cases([{
+            "input": meta.get("inputs"),
+            "expected": meta.get("expected"),
+            "got": got,
+        }])
 
     def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20,
                               timeout=1800, compact_feedback=False):
@@ -138,7 +180,8 @@ class LiveCodeBenchHandler(DatasetHandler):
         LCB ignores gt_file (LCB.save_formatted_gt returns None). The map_file
         sidecar is built alongside verify_file by build_verify_unit_test().
         compact_feedback is accepted for API symmetry with BCB but unused —
-        LCB.parse_worker_response always returns "" for fail_feedback.
+        the worker path (parse_worker_response) returns "" for fail_feedback;
+        rich (input, expected, got) feedback only comes from verify_unit_test().
         See PDB/dataset/livecodebench/install/worker_loop.py for the receiving end.
         """
         verify_path = Path(verify_file)
@@ -152,21 +195,28 @@ class LiveCodeBenchHandler(DatasetHandler):
     def parse_worker_response(self, resp):
         """Unpack the worker's score response into (fail_ids, correct_ids, fail_feedback).
 
-        Matches verify_unit_test()'s third element ("" for LCB) so callers
-        can swap the two.
+        The worker path returns "" for fail_feedback (training reward only needs
+        pass/fail); rich (input, expected, got) feedback comes from
+        verify_unit_test()'s third element, used by the eval agent.
         """
-        # LCB's verify_unit_test returns "" for fail_feedback (not a list).
-        # Worker returns a per-id list of empty strings; collapse to "" so
-        # downstream callers see the legacy shape.
         return resp["fail_ids"], resp["correct_ids"], ""
 
-    def build_verify_unit_test(self, log_file_prefix, results, sol_field="solution"):
+    def build_verify_unit_test(self, log_file_prefix, results, sol_field="solution",
+                               group_variants=True):
         """
         Build a JSON verification file for lcb_runner's custom evaluator.
 
         NOTE: LiveCodeBench groups multiple variants of the same problem
         by question_id. We also write a sidecar _map.json that maps each base question_id
         back to the full variant IDs, so verify_unit_test can reconstruct per-variant results.
+
+        group_variants: PDB names bug variants `<base>_<idx>` and groups them by
+        the base question_id (split on the first '_'). The raw-coding holdout
+        instead passes *real* LCB question_ids as task_ids — and Codeforces/AtCoder
+        ids legitimately contain '_' (e.g. "1873_A"). Splitting those corrupts the
+        id so lcb_runner finds no matching benchmark problem and silently scores
+        them 0. Callers whose task_ids are already real LCB question_ids must pass
+        group_variants=False so the id is used verbatim.
         """
         verify_file = log_file_prefix + ".json"
         # Group by normalized question id so multiple variants are evaluated together
@@ -176,7 +226,8 @@ class LiveCodeBenchHandler(DatasetHandler):
             code = entry.get(sol_field)
             if code is None:
                 continue
-            qid = str(entry["task_id"]).split("_", 1)[0]
+            tid = str(entry["task_id"])
+            qid = tid.split("_", 1)[0] if group_variants else tid
             grouped.setdefault(qid, [])
             grouped[qid].append(code)
             qid_to_full_ids.setdefault(qid, [])

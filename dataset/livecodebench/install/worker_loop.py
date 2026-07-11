@@ -40,7 +40,7 @@ import sys
 import time
 import traceback
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 
@@ -94,6 +94,12 @@ _POOL_RECYCLE_EVERY = int(os.environ.get("PDB_LCB_POOL_RECYCLE_EVERY", "50"))
 # Per-candidate timeout passed to evaluate_generations_by_problem.
 # Overridable via PDB_LCB_TIMEOUT to allow A/B comparison at runtime.
 _DEFAULT_TIMEOUT = int(os.environ.get("PDB_LCB_TIMEOUT", "3"))
+# Stall watchdog: if no candidate future completes within this many seconds
+# while work is still pending, treat the pool as wedged (a sandbox grandchild
+# deadlocked outside its per-task timeout) and recycle it instead of blocking
+# the training step indefinitely. Healthy flushes complete a future every few
+# seconds, so this never trips in normal operation.
+_POOL_STALL_S = float(os.environ.get("PDB_LCB_POOL_STALL_S", "90"))
 
 
 def _pool_child_init() -> None:
@@ -149,6 +155,30 @@ def _shutdown_pool() -> None:
         except Exception:
             pass
         _POOL = None
+
+
+def _force_recycle_pool() -> None:
+    """Drop a wedged pool and SIGKILL its workers so the next flush rebuilds.
+    Used when the stall watchdog fires: shutdown(wait=False) won't stop a
+    worker stuck on an unkillable sandbox grandchild, so we kill the worker
+    procs directly. Stragglers reparent and die on their own timeout — a
+    transient leak, not a hang."""
+    global _POOL, _POOL_FLUSH_COUNTER
+    pool = _POOL
+    _POOL = None
+    _POOL_FLUSH_COUNTER = 0
+    if pool is None:
+        return
+    procs = list(getattr(pool, "_processes", {}).values())
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
 atexit.register(_shutdown_pool)
@@ -329,11 +359,29 @@ def _handle_score_pool(req: dict, benchmark: list) -> dict:
 
     results_linear: dict[int, list] = {}
     metadatas_linear: dict[int, list] = {}
-    for fut in as_completed(futures):
-        i = futures[fut]
-        res, meta = fut.result()
-        results_linear[i] = res
-        metadatas_linear[i] = meta
+    pending = set(futures)
+    wedged = False
+    while pending:
+        done, pending = wait(pending, timeout=_POOL_STALL_S,
+                             return_when=FIRST_COMPLETED)
+        if not done:
+            wedged = True
+            break
+        for fut in done:
+            i = futures[fut]
+            res, meta = fut.result()
+            results_linear[i] = res
+            metadatas_linear[i] = meta
+    if wedged:
+        print(f"[lcb_worker] POOL STALL: no progress for {_POOL_STALL_S:.0f}s "
+              f"with {len(pending)}/{len(futures)} futures pending — failing "
+              f"stragglers and recycling pool", file=sys.stderr, flush=True)
+        for fut in pending:
+            i = futures[fut]
+            fut.cancel()
+            results_linear[i] = [[-1]]  # error sentinel -> _parse_eval scores fail
+            metadatas_linear[i] = [{"error": "pool_stall_timeout"}]
+        _force_recycle_pool()
     t_wait = time.monotonic()
 
     elapsed = time.monotonic() - t0

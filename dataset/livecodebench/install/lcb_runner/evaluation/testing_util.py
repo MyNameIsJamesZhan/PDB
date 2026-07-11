@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import sys
 import faulthandler
 import platform
@@ -447,10 +448,12 @@ def run_test(sample, test=None, debug=False, timeout=6):
     signal.signal(signal.SIGALRM, timeout_handler)
 
     # Disable functionalities that can make destructive changes to the test.
-    # Cap per-candidate RSS at 4 GiB so a runaway allocation gets killed by the
-    # kernel before it can OOM the host (see PreciseCoder job 2307285 autopsy).
-    # Matches the BCB worker's per-candidate limit for symmetry.
-    reliability_guard(maximum_memory_bytes=4 * 1024**3)
+    # Cap per-candidate RSS so a runaway allocation gets killed by the kernel
+    # before it can OOM the host (see PreciseCoder job 2307285 autopsy). Default
+    # 4 GiB (keep low for the training-reward path); raise via PDB_LCB_MEM_GB on
+    # the eval path where heavy @cache GT solutions legitimately need more.
+    _mem_gb = int(os.environ.get("PDB_LCB_MEM_GB", "4"))
+    reliability_guard(maximum_memory_bytes=_mem_gb * 1024**3)
 
     if debug:
         print(f"start = {datetime.now().time()}")

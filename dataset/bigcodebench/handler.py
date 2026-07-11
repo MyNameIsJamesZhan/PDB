@@ -52,7 +52,7 @@ class BigCodeBenchHandler(DatasetHandler):
             raise NotImplementedError
         return processed_data
 
-    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=20, timeout=1800):
+    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=60, timeout=1800, calibrated=True, parallel=-1):
         """
         Run unit tests using the bigcodebench.evaluate CLI.
 
@@ -95,6 +95,35 @@ class BigCodeBenchHandler(DatasetHandler):
         if selected_ids is not None:
             eval_args += ["--selective_evaluate", selected_ids]
         eval_args.append("--no_gt")
+        # calibrated=True prepends code_prompt + "pass" to each solution (BCB's
+        # completion-style default). Wrong for full-file/debug solutions — it doubles
+        # the function def. Pass calibrated=False to run the solution as-is.
+        eval_args += ["--calibrated", str(calibrated)]
+        # parallel<1 -> evaluate.py hardcodes n_workers=64 (it can't see our cpuset),
+        # which with heavy libs (numpy/sklearn/matplotlib) oversubscribes the cores and
+        # times out correct-but-slow tasks -> spurious failures. Always pass an explicit
+        # bound derived from the actual cpu affinity so scoring is deterministic.
+        if not parallel or parallel < 1:
+            n_cpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 8)
+            # Cap at 8: heavy tasks (scipy/matplotlib/filesystem, e.g. base 300/313)
+            # exceed the per-task wall-clock under higher worker contention. n_cpu can
+            # report the whole node, not our cpuset, so bound conservatively.
+            parallel = max(1, min(n_cpu - 1, 8))
+        eval_args += ["--parallel", str(parallel)]
+
+        # Cap BLAS/OpenMP to 1 thread per worker for the scoring subprocess ONLY.
+        # The BCB harness forks cpu_count()//2 workers; with unbounded BLAS threads
+        # (numpy/sklearn/matplotlib) those oversubscribe the cores and stall tasks past
+        # the per-task wall-clock limit -> spurious `timeout`, scored as failures
+        # (observed: ~40-46% of tasks, load-dependent). Scoped via the subprocess env
+        # so training/generation threading is untouched.
+        score_env = {
+            **os.environ,
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+        }
 
         try:
             subprocess.run(
@@ -102,6 +131,7 @@ class BigCodeBenchHandler(DatasetHandler):
                 cwd=workdir,
                 check=True,
                 timeout=timeout,
+                env=score_env,
             )
         except subprocess.CalledProcessError as e:
             print("Command failed with an error.")
@@ -127,10 +157,41 @@ class BigCodeBenchHandler(DatasetHandler):
                     correct_ids.append(task_id)
                 else:
                     fail_ids.append(task_id)
-                    fail_feedback.append(json.dumps(perfs[0].get("details", ""), indent=2))
+                    fail_feedback.append(self._bcb_feedback(perfs[0].get("details")))
             return fail_ids, correct_ids, fail_feedback
         else:
             raise FileNotFoundError(f"Cannot locate evaluation results for {base_name}")
+
+    @classmethod
+    def _bcb_feedback(cls, details) -> str:
+        """Turn BCB's per-test ``{test_name: traceback}`` details into uniform
+        (input, expected, got) triples. BCB tests are unittest assertion methods,
+        so ``input`` is the test-case name and expected/got come from the
+        ``AssertionError: <got> != <expected>`` line (falling back to the raised
+        exception line for non-assertion failures)."""
+        if isinstance(details, dict) and details:
+            return cls.format_failed_cases(
+                [cls._bcb_case(name, str(trace)) for name, trace in details.items()]
+            )
+        if details:  # timeout/error with a non-dict detail blob
+            return cls.format_failed_cases([{"got": str(details)}])
+        return ""
+
+    @staticmethod
+    def _bcb_case(test_name: str, trace: str) -> dict:
+        case = {"input": test_name, "expected": None, "got": None}
+        idx = trace.find("AssertionError:")
+        if idx != -1:
+            line = trace[idx + len("AssertionError:"):].split("\n", 1)[0].strip()
+            if " != " in line:
+                got, expected = line.split(" != ", 1)
+                case["got"], case["expected"] = got.strip(), expected.strip()
+            else:
+                case["got"] = line or "AssertionError"
+        else:
+            non_empty = [ln for ln in trace.splitlines() if ln.strip()]
+            case["got"] = non_empty[-1].strip() if non_empty else "error"
+        return case
 
     def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20,
                               timeout=1800, compact_feedback=False):
