@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -100,6 +101,25 @@ _DEFAULT_TIMEOUT = int(os.environ.get("PDB_LCB_TIMEOUT", "3"))
 # the training step indefinitely. Healthy flushes complete a future every few
 # seconds, so this never trips in normal operation.
 _POOL_STALL_S = float(os.environ.get("PDB_LCB_POOL_STALL_S", "90"))
+
+# Step-scoped execution cache. GRPO rollouts duplicate ~60% of candidate
+# solutions within a training step, and (evaluation sample, code) fully
+# determines the sandbox outcome, so duplicates are served from cache instead
+# of re-executed. Cleared whenever the request's `step` field changes;
+# stall-fabricated results never reach the insert path. PDB_CACHE_TIMEOUTS=0
+# additionally skips caching per-candidate timeouts (they can flip under
+# node load).
+_CACHE_ON = os.environ.get("PDB_EXEC_CACHE", "1") == "1"
+_CACHE_TIMEOUTS = os.environ.get("PDB_CACHE_TIMEOUTS", "1") == "1"
+_EXEC_CACHE: dict[tuple[str, str], tuple] = {}
+_CACHE_STEP: object = None
+
+
+def _is_timeout_result(meta) -> bool:
+    try:
+        return "Time Limit Exceeded" in json.dumps(meta)
+    except Exception:
+        return False
 
 
 def _pool_child_init() -> None:
@@ -290,6 +310,12 @@ def _handle_score_pool(req: dict, benchmark: list) -> dict:
     if not verify_file.exists():
         raise FileNotFoundError(f"verify_file does not exist: {verify_file}")
 
+    global _CACHE_STEP
+    step = req.get("step")
+    if _CACHE_ON and step != _CACHE_STEP:
+        _EXEC_CACHE.clear()
+        _CACHE_STEP = step
+
     with open(verify_file) as f:
         verify_input = json.load(f)
     ordered_qids = [d.get("question_id") for d in verify_input]
@@ -332,12 +358,17 @@ def _handle_score_pool(req: dict, benchmark: list) -> dict:
     generations_linear = []
     remap_index = []  # future_idx -> sorted_problem_idx
     generations_list_per_problem = []  # for the metadata length assertion
+    problem_hashes = []  # sorted_problem_idx -> sha256 of the evaluation sample
     for sorted_idx, qid in enumerate(common_qids):
         instance = benchmark_by_id[qid]
         code_list = out_by_id[qid]
         generations_list_per_problem.append(code_list)
         with _stdout_to_stderr():
             sample = instance.get_evaluation_sample()
+        if _CACHE_ON:
+            problem_hashes.append(hashlib.sha256(
+                json.dumps(sample, sort_keys=True, default=str).encode()
+            ).hexdigest())
         for code in code_list:
             samples_linear.append(sample)
             generations_linear.append([code])
@@ -349,16 +380,40 @@ def _handle_score_pool(req: dict, benchmark: list) -> dict:
     # Submit all candidates at once. evaluate_generations_by_problem's
     # signature is `args = (generations_list, sample, debug, timeout)`.
     futures = {}
+    results_linear: dict[int, list] = {}
+    metadatas_linear: dict[int, list] = {}
+    # In-request duplicates coalesce onto the first submission's future and
+    # get the result fanned out on completion (GRPO rollouts of one task all
+    # arrive in the same unit-pass request, so cache inserts alone are too
+    # late to catch them).
+    pending_by_key: dict[tuple[str, str], list[int]] = {}
+    cache_hits = 0
+    coalesced = 0
     for i in range(len(samples_linear)):
+        cache_key = None
+        if _CACHE_ON:
+            cache_key = (
+                problem_hashes[remap_index[i]],
+                hashlib.sha256(generations_linear[i][0].encode()).hexdigest(),
+            )
+            cached = _EXEC_CACHE.get(cache_key)
+            if cached is not None:
+                results_linear[i], metadatas_linear[i] = cached
+                cache_hits += 1
+                continue
+            shadows = pending_by_key.get(cache_key)
+            if shadows is not None:
+                shadows.append(i)
+                coalesced += 1
+                continue
+            pending_by_key[cache_key] = []
         fut = pool.submit(
             evaluate_generations_by_problem,
             (generations_linear[i], samples_linear[i], False, _DEFAULT_TIMEOUT),
         )
-        futures[fut] = i
+        futures[fut] = (i, cache_key)
     t_submit = time.monotonic()
 
-    results_linear: dict[int, list] = {}
-    metadatas_linear: dict[int, list] = {}
     pending = set(futures)
     wedged = False
     while pending:
@@ -368,19 +423,29 @@ def _handle_score_pool(req: dict, benchmark: list) -> dict:
             wedged = True
             break
         for fut in done:
-            i = futures[fut]
+            i, key = futures[fut]
             res, meta = fut.result()
             results_linear[i] = res
             metadatas_linear[i] = meta
+            if key is not None:
+                if _CACHE_TIMEOUTS or not _is_timeout_result(meta):
+                    _EXEC_CACHE[key] = (res, meta)
+                for j in pending_by_key.get(key, ()):
+                    results_linear[j] = res
+                    metadatas_linear[j] = meta
     if wedged:
         print(f"[lcb_worker] POOL STALL: no progress for {_POOL_STALL_S:.0f}s "
               f"with {len(pending)}/{len(futures)} futures pending — failing "
               f"stragglers and recycling pool", file=sys.stderr, flush=True)
         for fut in pending:
-            i = futures[fut]
+            i, key = futures[fut]
             fut.cancel()
             results_linear[i] = [[-1]]  # error sentinel -> _parse_eval scores fail
             metadatas_linear[i] = [{"error": "pool_stall_timeout"}]
+            if key is not None:
+                for j in pending_by_key.get(key, ()):
+                    results_linear[j] = [[-1]]
+                    metadatas_linear[j] = [{"error": "pool_stall_timeout"}]
         _force_recycle_pool()
     t_wait = time.monotonic()
 
@@ -427,7 +492,9 @@ def _handle_score_pool(req: dict, benchmark: list) -> dict:
           f"wait={t_wait - t_submit:.2f}s "
           f"metrics={t_metrics - t_wait:.2f}s "
           f"write={t_write - t_metrics:.2f}s "
-          f"total={t_write - t_setup_start:.2f}s",
+          f"total={t_write - t_setup_start:.2f}s "
+          f"cache step={step} hits={cache_hits} coalesced={coalesced} "
+          f"misses={len(futures)} size={len(_EXEC_CACHE)}",
           file=sys.stderr, flush=True)
 
     global _POOL_FLUSH_COUNTER

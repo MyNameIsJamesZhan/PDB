@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import json
 import multiprocessing
 import os
@@ -117,6 +118,17 @@ _POOL_RECYCLE_EVERY = int(os.environ.get("PDB_BCB_POOL_RECYCLE_EVERY", "50"))
 # the training step indefinitely. BCB per-task budget is ~20s, so the window is
 # wider than LCB's; healthy flushes still complete a future every few seconds.
 _POOL_STALL_S = float(os.environ.get("PDB_BCB_POOL_STALL_S", "180"))
+
+# Step-scoped execution cache. GRPO rollouts duplicate ~60% of candidate
+# solutions within a training step, and (test, solution) fully determines the
+# sandbox outcome, so duplicates are served from cache instead of re-executed.
+# Cleared whenever the request's `step` field changes; stall-fabricated
+# results never reach the insert path. PDB_CACHE_TIMEOUTS=0 additionally
+# skips caching per-candidate timeouts (they can flip under node load).
+_CACHE_ON = os.environ.get("PDB_EXEC_CACHE", "1") == "1"
+_CACHE_TIMEOUTS = os.environ.get("PDB_CACHE_TIMEOUTS", "1") == "1"
+_EXEC_CACHE: dict[tuple[str, str], tuple] = {}
+_CACHE_STEP: object = None
 
 
 def _make_pool() -> ProcessPoolExecutor:
@@ -296,6 +308,12 @@ def _handle_score_pool(req: dict) -> dict:
     gt_file = Path(req["gt_file"])
     timeout_per_task = int(req.get("timeout_per_task", 20))
 
+    global _CACHE_STEP
+    step = req.get("step")
+    if _CACHE_ON and step != _CACHE_STEP:
+        _EXEC_CACHE.clear()
+        _CACHE_STEP = step
+
     if verify_file.parent != gt_file.parent:
         raise ValueError(
             f"verify_file and gt_file must share a parent directory; "
@@ -334,6 +352,15 @@ def _handle_score_pool(req: dict) -> dict:
 
     completion_id: Counter[str] = Counter()
     futures: dict = {}
+    eval_results: dict[str, list[dict]] = defaultdict(list)
+    test_hash: dict[str, str] = {}
+    # In-request duplicates coalesce onto the first submission's future and
+    # get the result fanned out on completion (GRPO rollouts of one task all
+    # arrive in the same unit-pass request, so cache inserts alone are too
+    # late to catch them).
+    pending_by_key: dict[tuple[str, str], list[dict]] = {}
+    cache_hits = 0
+    coalesced = 0
     # Re-mirror evaluate.py's solution-assembly logic exactly so behavior
     # is byte-identical to the legacy path (see evaluate.py:363-384).
     with _stdout_to_stderr():
@@ -348,6 +375,40 @@ def _handle_score_pool(req: dict) -> dict:
             # calibrated=True default — see evaluate.py:368-369.
             solution = problems_subset[tid]["code_prompt"] + "\n    pass\n" + solution
             cid = completion_id[tid]
+            cache_key = None
+            if _CACHE_ON:
+                th = test_hash.get(tid)
+                if th is None:
+                    th = hashlib.sha256(
+                        (problems_subset[tid]["test"] + "\x00"
+                         + problems_subset[tid]["entry_point"]).encode()
+                    ).hexdigest()
+                    test_hash[tid] = th
+                cache_key = (th, hashlib.sha256(solution.encode()).hexdigest())
+                cached = _EXEC_CACHE.get(cache_key)
+                if cached is not None:
+                    eval_results[tid].append({
+                        "completion_id": cid,
+                        "task_id": tid,
+                        "_identifier": sample["_identifier"],
+                        "solution": solution,
+                        "base": cached,
+                    })
+                    completion_id[tid] += 1
+                    cache_hits += 1
+                    continue
+                shadows = pending_by_key.get(cache_key)
+                if shadows is not None:
+                    shadows.append({
+                        "completion_id": cid,
+                        "task_id": tid,
+                        "_identifier": sample["_identifier"],
+                        "solution": solution,
+                    })
+                    completion_id[tid] += 1
+                    coalesced += 1
+                    continue
+                pending_by_key[cache_key] = []
             args = (
                 cid,
                 problems_subset[tid],
@@ -367,11 +428,11 @@ def _handle_score_pool(req: dict) -> dict:
                 "task_id": tid,
                 "_identifier": sample["_identifier"],
                 "solution": solution,
+                "cache_key": cache_key,
             }
             completion_id[tid] += 1
     t_submit = time.monotonic()
 
-    eval_results: dict[str, list[dict]] = defaultdict(list)
     pending = set(futures)
     wedged = False
     while pending:
@@ -383,6 +444,12 @@ def _handle_score_pool(req: dict) -> dict:
         for fut in done:
             r = fut.result()
             eval_results[r["task_id"]].append(r)
+            key = futures[fut]["cache_key"]
+            if key is not None:
+                if _CACHE_TIMEOUTS or r["base"][0] != "timeout":
+                    _EXEC_CACHE[key] = r["base"]
+                for shadow in pending_by_key.get(key, ()):
+                    eval_results[shadow["task_id"]].append({**shadow, "base": r["base"]})
     if wedged:
         print(f"[bcb_worker] POOL STALL: no progress for {_POOL_STALL_S:.0f}s "
               f"with {len(pending)}/{len(futures)} futures pending — failing "
@@ -397,6 +464,10 @@ def _handle_score_pool(req: dict) -> dict:
                 "solution": info["solution"],
                 "base": ("fail", "pool_stall_timeout"),
             })
+            if info["cache_key"] is not None:
+                for shadow in pending_by_key.get(info["cache_key"], ()):
+                    eval_results[shadow["task_id"]].append(
+                        {**shadow, "base": ("fail", "pool_stall_timeout")})
         _force_recycle_pool()
     t_wait = time.monotonic()
 
@@ -433,7 +504,9 @@ def _handle_score_pool(req: dict) -> dict:
           f"wait={t_wait - t_submit:.2f}s "
           f"agg={t_aggregate - t_wait:.2f}s "
           f"write={t_write - t_aggregate:.2f}s "
-          f"total={elapsed:.2f}s",
+          f"total={elapsed:.2f}s "
+          f"cache step={step} hits={cache_hits} coalesced={coalesced} "
+          f"misses={len(futures)} size={len(_EXEC_CACHE)}",
           file=sys.stderr, flush=True)
 
     global _POOL_FLUSH_COUNTER
