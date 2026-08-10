@@ -52,3 +52,8 @@ results/*/*/log
 dataset/*/data/log
 bash_log/
 logs/
+# Per-task eval outputs (scores + evaluator logs). Regenerable, and swesmith
+# alone is ~43 MB. The dataset artifacts under results/*/bug_data/ stay tracked.
+results/*/eval_results/
+# stdin scratch captured by the LiveCodeBench evaluator install dir
+dataset/*/install/input.txt
