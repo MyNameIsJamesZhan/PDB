@@ -156,6 +156,7 @@ class Evaluator:
 
             for name, metric in self.metrics.items():
                 print(f"{name}:", metric(name))
+            self._annotate_unit_gated()
             self.save_results()
             self.print_summary()
             return self.scores
@@ -627,6 +628,27 @@ class Evaluator:
 
         return "Precision", avg_precision, "Recall", avg_recall, "F1", avg_f1
 
+    def _annotate_unit_gated(self):
+        """Add unit-gated recall/F1 to every symbolic entry, alongside the measured ones.
+
+        A prediction that passes every unit test has fixed every bug by
+        construction, so a GT block left unmatched there is a block-matcher miss
+        rather than a model miss. These fields record that reading; `recall` and
+        `f1` keep the purely symbolic one so both stay comparable.
+
+        Post-hoc rather than inline in symbolic_block_score: the cross-file path
+        scores symbolically before it runs unit tests, and swesmith
+        structural-only runs have no unit metric at all (unit_gated == measured).
+        """
+        unit = self.scores.get("Unit score") or {}
+        for task_id, entry in (self.scores.get("Symbolic block scores") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            p = entry.get("precision", 0.0) or 0.0
+            r = 1.0 if unit.get(task_id) == 1 else (entry.get("recall", 0.0) or 0.0)
+            entry["unit_gated_recall"] = r
+            entry["unit_gated_f1"] = (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
+
     def _extract_pr_components(self, gt_diff, pred_diff, matched_blocks_entry):
         """
         Extract raw P/R numerators and denominators for one file evaluation.
@@ -810,6 +832,7 @@ class Evaluator:
         self.scores = cross_file_scores
         self.results = results
         self.round = round or 1
+        self._annotate_unit_gated()
 
         # Print summary
         n = len(results)
@@ -856,10 +879,13 @@ class Evaluator:
         p = sum(v["precision"] for v in sym.values())
         r = sum(v["recall"]    for v in sym.values())
         f = sum(v["f1"]        for v in sym.values())
+        ug = sum(v.get("unit_gated_f1", v["f1"]) for v in sym.values())
+        ugr = sum(v.get("unit_gated_recall", v["recall"]) for v in sym.values())
         el = sum(v.get("edit_line", 0)   for v in sym.values())
         eb = sum(v.get("edit_blocks", 0) for v in sym.values())
         print(f"[summary] {self.model_name} on {self.eval_set_name} round {self.round}: "
               f"unit={unit_str} prec={p/n:.3f} rec={r/n:.3f} f1={f/n:.3f} "
+              f"ugrec={ugr/n:.3f} ugf1={ug/n:.3f} "
               f"eline={el/n:.2f} eblk={eb/n:.2f} (n={n})")
 
 
