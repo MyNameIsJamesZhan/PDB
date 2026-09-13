@@ -131,6 +131,36 @@ _EXEC_CACHE: dict[tuple[str, str], tuple] = {}
 _CACHE_STEP: object = None
 
 
+# Top-level modules by frequency across the 1140 BCB tasks (code_prompt + test),
+# heavy ones only; stdlib is instant. Override with PDB_BCB_PRELOAD_MODULES=a,b,c.
+_PRELOAD_MODULES = (
+    "numpy", "pandas", "matplotlib", "matplotlib.pyplot", "sklearn",
+    "sklearn.linear_model", "sklearn.preprocessing", "sklearn.model_selection",
+    "sklearn.cluster", "sklearn.metrics", "scipy", "scipy.stats", "scipy.optimize",
+    "seaborn", "statsmodels.api", "statsmodels.formula.api", "requests", "faker",
+    "nltk", "pytz", "bs4", "PIL", "dateutil", "cv2", "sympy", "networkx",
+)
+
+
+def _preload_heavy_libs() -> None:
+    import importlib
+    mods = os.environ.get("PDB_BCB_PRELOAD_MODULES")
+    mods = mods.split(",") if mods else _PRELOAD_MODULES
+    t0 = time.monotonic()
+    loaded, failed = [], []
+    for m in mods:
+        m = m.strip()
+        if not m:
+            continue
+        try:
+            importlib.import_module(m)
+            loaded.append(m)
+        except Exception as e:  # missing optional dep: the test would fail the same way
+            failed.append(f"{m}({type(e).__name__})")
+    print(f"[bcb_worker] preloaded {len(loaded)} modules in {time.monotonic() - t0:.1f}s"
+          + (f"; skipped {failed}" if failed else ""), file=sys.stderr, flush=True)
+
+
 def _make_pool() -> ProcessPoolExecutor:
     # Respect cgroup CPU limit via sched_getaffinity rather than the raw
     # hardware thread count from cpu_count(). On Grace Hopper nodes
@@ -635,6 +665,16 @@ def main() -> int:
     # at this point — they inherit the loaded `problems` dict via COW
     # but never touch it (each request loads its own problems_subset
     # from gt_file), so the pages stay shared.
+    # Pre-import the heavy libraries BCB tasks use before forking the pool, so
+    # every forked test process inherits them through sys.modules instead of
+    # re-importing from disk. On a cold shared filesystem (Anvil GPFS) a fresh
+    # `import sklearn/scipy/statsmodels/matplotlib` costs 20-90 s -- more than
+    # the 20 s per-candidate budget -- and correct solutions score `timeout`
+    # (measured: 11/11 val GT timed out on a cold node, 5/11 still warm; the
+    # tests themselves run in ~3 s). Module state is copied at fork, so each
+    # test still starts from the same pristine snapshot. PDB_BCB_PRELOAD=0 opts out.
+    if os.environ.get("PDB_BCB_PRELOAD", "1") == "1":
+        _preload_heavy_libs()
     if _USE_PERSISTENT_POOL:
         _ensure_pool()
 
