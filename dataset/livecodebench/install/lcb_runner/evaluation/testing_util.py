@@ -453,7 +453,16 @@ def run_test(sample, test=None, debug=False, timeout=6):
     # 4 GiB (keep low for the training-reward path); raise via PDB_LCB_MEM_GB on
     # the eval path where heavy @cache GT solutions legitimately need more.
     _mem_gb = int(os.environ.get("PDB_LCB_MEM_GB", "4"))
-    reliability_guard(maximum_memory_bytes=_mem_gb * 1024**3)
+    _mem_bytes = _mem_gb * 1024**3
+    # RLIMIT_AS counts the address space this process already has. Candidates are
+    # forked from the persistent worker, which holds the whole benchmark (~9 GB heap)
+    # plus torch/CUDA libs: ~15 GB VmSize on x86 (Anvil). A 4 GiB absolute cap is then
+    # below the inherited size, so any candidate that needs a fresh mapping dies with a
+    # bare MemoryError (error_code -4, empty message) -- correct solutions included.
+    # PDB_LCB_MEM_RELATIVE=1 caps *additional* allocation at PDB_LCB_MEM_GB instead.
+    if os.environ.get("PDB_LCB_MEM_RELATIVE", "0") == "1":
+        _mem_bytes += _current_vm_bytes()
+    reliability_guard(maximum_memory_bytes=_mem_bytes)
 
     if debug:
         print(f"start = {datetime.now().time()}")
@@ -523,6 +532,17 @@ def run_test(sample, test=None, debug=False, timeout=6):
                 }
             finally:
                 signal.alarm(0)
+
+
+def _current_vm_bytes():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
 
 
 def reliability_guard(maximum_memory_bytes=None):
