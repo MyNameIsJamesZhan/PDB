@@ -13,6 +13,7 @@ import difflib
 import json
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,8 @@ from dataset.base import DatasetHandler
 from utils import get_indentation
 
 _DEFAULT_DATA_FILE = Path(__file__).parent / "data" / "pdb_swe.json"
+# Per-file fields shared by every task on the same target file.
+_FILE_FIELDS = ("repo", "target_file", "image_name")
 _INSTALL_MSG = (
     f"Ensure {_INSTALL_DIR}/SWE-smith and {_INSTALL_DIR}/SWE-bench exist "
     "(see dataset/swesmith/install/README.md)"
@@ -145,11 +148,59 @@ class SWESmithHandler(DatasetHandler):
         target = Path(data_file) if data_file else _DEFAULT_DATA_FILE
         if target.exists():
             data = json.load(open(target))
-            self._data_index = {item["task_id"]: item for item in data}
+            self._data_index = self._build_index(data)
             print(f"[SWESmithHandler] loaded {len(self._data_index)} instances from {target}")
         else:
             print(f"[SWESmithHandler] WARNING: data file not found at {target}. "
                   "Run create_swesmith_data.py to generate it.")
+
+    @staticmethod
+    def _build_index(data: list[dict]) -> dict[str, dict]:
+        """task_id -> metadata, merged across the rows that share a task_id.
+
+        NOTE: [edge case callout] Buggy variants reuse one task_id, and many
+        variant rows carry no repo/target_file/image_name. Keeping only the last
+        row left 100 of the 192 released ids without target_file, so their fix
+        patch targeted a placeholder `solution.py`. Take the first non-empty
+        value per field across a task's rows, then fall back to sibling tasks on
+        the same file (same id minus the trailing `_<n>`).
+        """
+        index: dict[str, dict] = {}
+        for item in data:
+            merged = index.setdefault(item["task_id"], {})
+            for k, v in item.items():
+                if v and not merged.get(k):
+                    merged[k] = v
+        siblings: dict[str, dict] = {}
+        for task_id, item in index.items():
+            fields = siblings.setdefault(re.sub(r"_\d+$", "", task_id), {})
+            for k in _FILE_FIELDS:
+                if item.get(k) and not fields.get(k):
+                    fields[k] = item[k]
+        for task_id, item in index.items():
+            fields = siblings[re.sub(r"_\d+$", "", task_id)]
+            for k in _FILE_FIELDS:
+                if not item.get(k) and fields.get(k):
+                    item[k] = fields[k]
+        return index
+
+    def _meta(self, task_id: str) -> dict:
+        """Index row for task_id or for an id the evaluator derived from it.
+
+        Derived ids are `<base>@<sha8>` (row key for a duplicated task_id) plus
+        up to three `_<n>` suffixes (semantic-equivalence `_<block>`, redundancy
+        `_<block>_<tol>_<count>`). Variants of one task_id share gt_solution,
+        repo and target_file, so resolving to the base row is exact.
+        """
+        base = task_id.split("@", 1)[0]
+        for _ in range(4):
+            if base in self._data_index:
+                return self._data_index[base]
+            head, _, tail = base.rpartition("_")
+            if not head or not tail.isdigit():
+                break
+            base = head
+        return {}
 
     # ── DatasetHandler interface ──────────────────────────────────────────────
 
@@ -262,7 +313,7 @@ class SWESmithHandler(DatasetHandler):
         with open(verify_file, "w") as f:
             for item in results:
                 task_id = item.get("task_id", "")
-                meta = self._data_index.get(task_id, {})
+                meta = self._meta(task_id)
                 f.write(json.dumps({
                     "task_id": task_id,
                     "solution": item.get(sol_field, ""),
@@ -373,7 +424,7 @@ class SWESmithHandler(DatasetHandler):
             repo = entry.get("repo", "")
             target_file = entry.get("target_file", "solution.py")
             model_solution = entry.get("solution", "")
-            meta = self._data_index.get(task_id, {})
+            meta = self._meta(task_id)
             gt_solution = meta.get("gt_solution", "") or entry.get("gt_solution", "")
 
             if not gt_solution or not model_solution or not repo:

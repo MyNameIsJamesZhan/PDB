@@ -18,13 +18,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import json
 import copy
+import hashlib
 import argparse
 
 from dataset import get_handler
 from utils import file_diff, parse_diff_to_blocks, verify_block_single_diff, verify_block_diff, expand_blocks_to_diff, rstrip_lines, \
     apply_diff
 from config import DEFAULT_TOLERANCE_MULTILINE, DEFAULT_TOLERANCE_SINGLELINE, EVAL_MAX_LINES_PER_BLOCK
-from collections import defaultdict
+from collections import Counter, defaultdict
 from argparse import ArgumentParser
 
 # Symbolic-scoring cost guard. A precise fix edits a handful of lines, so a
@@ -59,6 +60,11 @@ class Evaluator:
         # prediction is scored on its merits. Default OFF so the evaluator
         # measures faithfully; the training reward path opts IN explicitly.
         self.pred_diff_guard = getattr(args, "pred_diff_guard", False)
+        # GT-diff validation switch. ON (default): rows whose gt_diff breaks the
+        # generator's block-count/stride/line-cap contract are skipped. OFF: score
+        # every row — needed for SWE-smith, whose real-PR gt_diffs legitimately
+        # have more blocks than bug_count and adjacent blocks.
+        self.check_gt_diff = getattr(args, "check_gt_diff", True)
         self.round = 0
         assert self.tolerance >= 0, "tolerance must be >= 0"
         self.gt, self.buggy_code, self.pred, self.gt_diff, self.pred_diff, self.eval_ids, self.eval_results = [], [], [], [], [], [], []
@@ -98,7 +104,19 @@ class Evaluator:
         """
         self.gt, self.buggy_code, self.pred, self.gt_diff, self.pred_diff = [], [], [], [], []
         final_results = {}
+        # NOTE: [edge case callout] SWE-smith reuses one task_id across several
+        # buggy variants of the same file. Every per-row list below is zipped with
+        # eval_ids, so rows must be keyed uniquely or all later rows shift onto a
+        # neighbour's prediction. Duplicated ids get an `@<sha1(buggy)[:8]>`
+        # suffix; handlers resolve it back to the base id.
+        id_counts = Counter(s["task_id"] for s in results)
         for s in results:
+            if id_counts[s["task_id"]] > 1:
+                sha = hashlib.sha1(s["buggy_code"].encode()).hexdigest()[:8]
+                s = {**s, "task_id": f"{s['task_id']}@{sha}"}
+            if s["task_id"] in final_results:
+                print(f"[skip] {s['task_id']}: duplicate row")
+                continue
             if "gt_diff" in s:
                 gt_diff = s["gt_diff"]
             else:
@@ -106,9 +124,12 @@ class Evaluator:
             # Validate: correct block count + per-block line cap + stride gap.
             # NOTE: [design thought] Stride is genuinely re-checked here so the
             # evaluator is self-contained. Failures become a skip-with-warning.
-            ver_gt_diff, err_str = verify_block_diff(gt_diff, block_count=s["bug_count"],
-                                                     stride=self.stride,
-                                                     max_lines_per_block=EVAL_MAX_LINES_PER_BLOCK)
+            if self.check_gt_diff:
+                ver_gt_diff, err_str = verify_block_diff(gt_diff, block_count=s["bug_count"],
+                                                         stride=self.stride,
+                                                         max_lines_per_block=EVAL_MAX_LINES_PER_BLOCK)
+            else:
+                ver_gt_diff, err_str = bool(gt_diff), "empty gt_diff"
             if ver_gt_diff:
                 final_results[s["task_id"]] = s
                 self.gt_diff.append(gt_diff)
@@ -137,6 +158,8 @@ class Evaluator:
 
         self.eval_ids = list(final_results.keys())
         self.eval_results = list(final_results.values())
+        assert len(self.eval_ids) == len(self.pred) == len(self.gt_diff) == len(self.pred_diff), \
+            "eval_ids and per-row lists are misaligned"
         if self.results:
             self.results = [final_results.get(item["task_id"], item) for item in self.results]
         else:
