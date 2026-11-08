@@ -1,0 +1,125 @@
+[project]
+name = "bigcodebench"
+version = "0.2.5"
+description = "Evaluation package for BigCodeBench (vendored for debugeval)"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "appdirs>=1.4.4",
+    "datasets>=3.2.0",
+    "e2b>=1.0.0",
+    "fire>=0.6.0",
+    "gradio-client>=1.0",
+    "httpx>=0.27",
+    "multipledispatch>=0.6.0",
+    "pqdm>=0.2.0",
+    "rich>=13.0",
+    "tempdir>=0.7.1",
+    "termcolor>=2.0.0",
+    "tqdm>=4.56.0",
+    "transformers>=4.40",
+    "tree-sitter>=0.22",
+    "tree-sitter-languages>=1.10.2",
+    "tree-sitter-python>=0.23",
+    "wget>=3.2",
+]
+
+[project.optional-dependencies]
+# Sandbox runtime deps that BigCodeBench tests can import. Versions are
+# loosened from the upstream Requirements/requirements-eval.txt strict pins
+# to a known-working set (matching the legacy Evaluate conda env on this host)
+# so uv can resolve them without conflicts.
+eval = [
+    "beautifulsoup4>=4.12",
+    "blake3>=0.4",
+    "chardet>=5.2",
+    "cryptography>=38.0",
+    "DateTime>=5.5",
+    "Django>=4.2",
+    "dnspython>=2.6",
+    "docxtpl>=0.11",
+    "Faker>=20.1",
+    "Flask>=3.0",
+    "Flask-Login>=0.6",
+    "Flask-Mail>=0.9",
+    "Flask-RESTful>=0.3.10",
+    "Flask-WTF>=1.2",
+    "folium>=0.16",
+    "gensim>=4.3",
+    "geopandas>=0.13",
+    "geopy>=2.4",
+    "holidays>=0.29",
+    "keras==2.11.0",
+    "Levenshtein>=0.25",
+    "librosa>=0.10",
+    "lxml>=4.9",
+    "matplotlib>=3.7",
+    "mechanize>=0.4",
+    "natsort>=7.1",
+    "networkx>=2.6",
+    "nltk>=3.8",
+    "numba>=0.56",
+    "numpy>=1.23,<2",
+    "opencv-python-headless>=4.9",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "Pillow>=10.3",
+    "prettytable>=3.10",
+    "psutil>=5.9",
+    "pycryptodome>=3.14",
+    "pyfakefs>=5.4",
+    "pyquery>=1.4",
+    "pytesseract>=0.3.10",
+    "pytest>=8.2",
+    "python-dateutil>=2.9",
+    "python-docx>=1.1",
+    "pytz>=2023.3",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+    "requests-mock>=1.11",
+    "rsa>=4.9",
+    "scikit-image>=0.18",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+    "seaborn>=0.13",
+    "selenium>=4.15",
+    "sendgrid>=6.11",
+    "shapely>=2.0",
+    "soundfile>=0.12",
+    "statsmodels>=0.14",
+    "sympy>=1.12",
+    "tensorflow==2.11.0",
+    "TextBlob>=0.18",
+    "texttable>=1.7",
+    "Werkzeug>=3.0",
+    "wikipedia>=1.4",
+    "wordcloud>=1.9",
+    "wordninja>=2.0",
+    "WTForms>=3.1",
+    "xlrd>=2.0",
+    "xlwt>=1.3",
+    "xmltodict>=0.13",
+]
+
+[project.scripts]
+"bigcodebench.evaluate" = "bigcodebench.evaluate:main"
+"bigcodebench.sanitize" = "bigcodebench.sanitize:main"
+"bigcodebench.syncheck" = "bigcodebench.syncheck:main"
+"bigcodebench.generate" = "bigcodebench.generate:main"
+"bigcodebench.inspect" = "bigcodebench.inspect:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bigcodebench"]
+
+[tool.uv]
+# tensorflow==2.11 overstates its protobuf upper bound (<3.20) in pip metadata,
+# but in practice it coexists fine with protobuf>=5 — the legacy Evaluate conda
+# env proves this (TF 2.11 + protobuf 5.29.4 running side-by-side). Overriding
+# here so uv can resolve e2b (which needs protobuf>=3.20) alongside TF 2.11.
+override-dependencies = [
+    "protobuf>=5.0,<6.0",
+]
