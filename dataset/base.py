@@ -1,4 +1,5 @@
 import inspect
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import ClassVar
@@ -45,8 +46,14 @@ class DatasetHandler(ABC):
 
     @property
     def venv_python(self) -> Path:
-        """Python interpreter inside the dataset's uv-managed .venv."""
-        return self.install_dir / ".venv" / "bin" / "python"
+        """Python interpreter inside the dataset's uv-managed venv.
+
+        The directory name defaults to ``.venv``; set ``$PDB_VENV_NAME`` (e.g.
+        ``.venv-x86``) to keep per-architecture venvs side by side on a shared
+        filesystem. Build it with ``UV_PROJECT_ENVIRONMENT=$PDB_VENV_NAME uv sync``.
+        """
+        venv_name = os.environ.get("PDB_VENV_NAME", ".venv")
+        return self.install_dir / venv_name / "bin" / "python"
 
     def venv_cmd(self, module: str, *args: str) -> list[str]:
         """
@@ -62,6 +69,62 @@ class DatasetHandler(ABC):
                 f"(see {self.install_dir.parent}/README.md for full setup)."
             )
         return [str(self.venv_python), "-m", module, *args]
+
+    # Cap and truncation for the run_tests failure feedback shown to the agent.
+    MAX_FAILED_CASES: ClassVar[int] = 3
+    MAX_CASE_FIELD_CHARS: ClassVar[int] = 600
+
+    @classmethod
+    def format_failed_cases(cls, cases: list[dict]) -> str:
+        """Render up to ``MAX_FAILED_CASES`` failing tests as uniform
+        ``(input, expected, got)`` triples for run_tests feedback.
+
+        Each case is a dict with optional ``input``/``expected``/``got`` keys
+        (missing keys are skipped — e.g. BCB assertion tests have no scalar
+        input, LCB runtime errors have no clean ``got``). Long fields are
+        truncated; the agent applies a final overall cap.
+        """
+        if not cases:
+            return ""
+        lines = []
+        for i, c in enumerate(cases[: cls.MAX_FAILED_CASES], 1):
+            lines.append(f"Test {i}:")
+            for label in ("input", "expected", "got"):
+                if c.get(label) is None:
+                    continue
+                val = str(c[label])
+                if len(val) > cls.MAX_CASE_FIELD_CHARS:
+                    val = val[: cls.MAX_CASE_FIELD_CHARS] + " …(truncated)"
+                val = val.replace("\n", "\n    ")
+                lines.append(f"  {label}: {val}")
+        extra = len(cases) - cls.MAX_FAILED_CASES
+        if extra > 0:
+            lines.append(f"(+{extra} more failing test(s) not shown)")
+        return "\n".join(lines)
+
+    @property
+    def worker_script(self) -> Path:
+        """Path to this dataset's persistent worker script."""
+        return self.install_dir / "worker_loop.py"
+
+    def spawn_worker_cmd(self) -> list[str]:
+        """Command to spawn this dataset's persistent evaluator worker.
+
+        The worker is a long-lived ``<venv>/bin/python worker_loop.py`` process
+        that loads the dataset once and answers ``score`` requests as JSON lines
+        on stdin/stdout; the wire format is documented in ``worker_loop.py``.
+        """
+        if not self.worker_script.exists():
+            raise RuntimeError(
+                f"worker_loop.py missing at {self.worker_script}. "
+                f"This dataset hasn't been wired for persistent workers yet."
+            )
+        if not self.venv_python.exists():
+            raise RuntimeError(
+                f"uv venv missing at {self.venv_python}. "
+                f"Run `cd {self.install_dir} && uv sync`."
+            )
+        return [str(self.venv_python), str(self.worker_script)]
 
     def mark_editable_lines(self, data):
         """

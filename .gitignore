@@ -51,3 +51,8 @@ wheels/
 results/*/*/log
 dataset/*/data/log
 bash_log/
+logs/
+# Per-task eval outputs (regenerable); results/*/bug_data/ stays tracked.
+results/*/eval_results/
+# stdin scratch written by the LiveCodeBench evaluator
+dataset/*/install/input.txt

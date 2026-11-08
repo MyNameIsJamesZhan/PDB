@@ -18,13 +18,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import json
 import copy
+import hashlib
+import argparse
 
 from dataset import get_handler
 from utils import file_diff, parse_diff_to_blocks, verify_block_single_diff, verify_block_diff, expand_blocks_to_diff, rstrip_lines, \
     apply_diff
 from config import DEFAULT_TOLERANCE_MULTILINE, DEFAULT_TOLERANCE_SINGLELINE, EVAL_MAX_LINES_PER_BLOCK
-from collections import defaultdict
+from collections import Counter, defaultdict
 from argparse import ArgumentParser
+
+# Symbolic-scoring cost guard. A predicted diff far larger than the GT diff cannot
+# be precise, and it makes block matching and the semantic unit-test fan-out
+# unboundedly expensive. When len(pred_diff) > MULT * len(gt_diff) + PLUS (and the
+# guard is on), matching is skipped and precision = recall = f1 = 0; the unit score
+# is computed separately and unaffected.
+PRED_DIFF_GUARD_MULT = int(os.environ.get("PDB_MAX_PRED_DIFF_MULT", "2"))
+PRED_DIFF_GUARD_PLUS = int(os.environ.get("PDB_MAX_PRED_DIFF_PLUS", "3"))
 
 
 class Evaluator:
@@ -42,6 +52,14 @@ class Evaluator:
         # lines for full precision credit. Default: 1 for multiline mode,
         # 2 for single-line mode.
         self.tolerance = args.tolerance
+        # Pred-diff guard (see above). Off by default so evaluation scores every
+        # prediction; RL reward computation turns it on.
+        self.pred_diff_guard = getattr(args, "pred_diff_guard", False)
+        # GT-diff validation switch. ON (default): rows whose gt_diff breaks the
+        # generator's block-count/stride/line-cap contract are skipped. OFF: score
+        # every row — needed for SWE-smith, whose real-PR gt_diffs legitimately
+        # have more blocks than bug_count and adjacent blocks.
+        self.check_gt_diff = getattr(args, "check_gt_diff", True)
         self.round = 0
         assert self.tolerance >= 0, "tolerance must be >= 0"
         self.gt, self.buggy_code, self.pred, self.gt_diff, self.pred_diff, self.eval_ids, self.eval_results = [], [], [], [], [], [], []
@@ -50,6 +68,16 @@ class Evaluator:
             "Unit score": self.unit_score,
             "Symbolic block scores": self.symbolic_block_score,
         }
+        # SWE-smith scores unit tests inside per-instance containers (Docker or
+        # Apptainer, x86-64). When no container backend is available
+        # (PDB_SWE_BACKEND unset or "none"), run structural-only: drop the Unit
+        # score metric so we never invoke the container path. Symbolic block
+        # scores still compute (exact-match precision/recall need no container).
+        if self.dataset == "swesmith" and \
+                os.environ.get("PDB_SWE_BACKEND", "none").strip().lower() in ("", "none"):
+            self.metrics.pop("Unit score", None)
+            print("[Evaluator] swesmith structural-only mode "
+                  "(PDB_SWE_BACKEND=none): skipping Unit score")
         self.scores = {metrics: {} for metrics in self.metrics}
         self.results = []
         self.error_msg = None
@@ -71,7 +99,19 @@ class Evaluator:
         """
         self.gt, self.buggy_code, self.pred, self.gt_diff, self.pred_diff = [], [], [], [], []
         final_results = {}
+        # SWE-smith reuses one task_id across several
+        # buggy variants of the same file. Every per-row list below is zipped with
+        # eval_ids, so rows must be keyed uniquely or all later rows shift onto a
+        # neighbour's prediction. Duplicated ids get an `@<sha1(buggy)[:8]>`
+        # suffix; handlers resolve it back to the base id.
+        id_counts = Counter(s["task_id"] for s in results)
         for s in results:
+            if id_counts[s["task_id"]] > 1:
+                sha = hashlib.sha1(s["buggy_code"].encode()).hexdigest()[:8]
+                s = {**s, "task_id": f"{s['task_id']}@{sha}"}
+            if s["task_id"] in final_results:
+                print(f"[skip] {s['task_id']}: duplicate row")
+                continue
             if "gt_diff" in s:
                 gt_diff = s["gt_diff"]
             else:
@@ -79,9 +119,12 @@ class Evaluator:
             # Validate: correct block count + per-block line cap + stride gap.
             # NOTE: [design thought] Stride is genuinely re-checked here so the
             # evaluator is self-contained. Failures become a skip-with-warning.
-            ver_gt_diff, err_str = verify_block_diff(gt_diff, block_count=s["bug_count"],
-                                                     stride=self.stride,
-                                                     max_lines_per_block=EVAL_MAX_LINES_PER_BLOCK)
+            if self.check_gt_diff:
+                ver_gt_diff, err_str = verify_block_diff(gt_diff, block_count=s["bug_count"],
+                                                         stride=self.stride,
+                                                         max_lines_per_block=EVAL_MAX_LINES_PER_BLOCK)
+            else:
+                ver_gt_diff, err_str = bool(gt_diff), "empty gt_diff"
             if ver_gt_diff:
                 final_results[s["task_id"]] = s
                 self.gt_diff.append(gt_diff)
@@ -110,6 +153,8 @@ class Evaluator:
 
         self.eval_ids = list(final_results.keys())
         self.eval_results = list(final_results.values())
+        assert len(self.eval_ids) == len(self.pred) == len(self.gt_diff) == len(self.pred_diff), \
+            "eval_ids and per-row lists are misaligned"
         if self.results:
             self.results = [final_results.get(item["task_id"], item) for item in self.results]
         else:
@@ -129,6 +174,7 @@ class Evaluator:
 
             for name, metric in self.metrics.items():
                 print(f"{name}:", metric(name))
+            self._annotate_unit_gated()
             self.save_results()
             self.print_summary()
             return self.scores
@@ -273,6 +319,9 @@ class Evaluator:
         all_buggy = {task_id: buggy for task_id, buggy in zip(self.eval_ids, self.buggy_code)}
 
         for task_id, gt_diff, pred_diff in zip(self.eval_ids, self.gt_diff, self.pred_diff):
+            # Skip pathological over-edits (guard on only); scored 0/0/0.
+            if self.pred_diff_guard and len(pred_diff) > PRED_DIFF_GUARD_MULT * len(gt_diff) + PRED_DIFF_GUARD_PLUS:
+                continue
             remain_gt_diff = copy.deepcopy(gt_diff)
             remain_pred_diff = copy.deepcopy(pred_diff)
             remain_gt_blocks = parse_diff_to_blocks(remain_gt_diff)[::-1]
@@ -529,6 +578,8 @@ class Evaluator:
         #   where tolerance credit accounts for the essential edit size found
         #   by the deep redundancy check.
         for task_id, gt_diff, pred_diff in zip(self.eval_ids, self.gt_diff, self.pred_diff):
+            edit_line = len(pred_diff)
+            edit_blocks = len(parse_diff_to_blocks(pred_diff)) if pred_diff else 0
 
             if not gt_diff:
                 raise ValueError(f"Ground truth empty for {task_id}")
@@ -580,6 +631,8 @@ class Evaluator:
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
+                "edit_line": edit_line,
+                "edit_blocks": edit_blocks,
                 "matched_blocks": matched_blocks[task_id],
                 "unmatched_pred": unmatched_pred[task_id],
                 "unmatched_gt": unmatched_gt[task_id]
@@ -592,6 +645,230 @@ class Evaluator:
         avg_f1 = sum([eval_score["f1"] for _, eval_score in self.scores[metric_name].items()]) / len(self.results)
 
         return "Precision", avg_precision, "Recall", avg_recall, "F1", avg_f1
+
+    def _annotate_unit_gated(self):
+        """Add unit-gated recall/F1 to every symbolic entry, alongside the measured ones.
+
+        A prediction that passes every unit test has fixed every bug by
+        construction, so a GT block left unmatched there is a block-matcher miss
+        rather than a model miss. These fields record that reading; `recall` and
+        `f1` keep the purely symbolic one so both stay comparable.
+
+        Post-hoc rather than inline in symbolic_block_score: the cross-file path
+        scores symbolically before it runs unit tests, and swesmith
+        structural-only runs have no unit metric at all (unit_gated == measured).
+        """
+        unit = self.scores.get("Unit score") or {}
+        for task_id, entry in (self.scores.get("Symbolic block scores") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            p = entry.get("precision", 0.0) or 0.0
+            r = 1.0 if unit.get(task_id) == 1 else (entry.get("recall", 0.0) or 0.0)
+            entry["unit_gated_recall"] = r
+            entry["unit_gated_f1"] = (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
+
+    def _extract_pr_components(self, gt_diff, pred_diff, matched_blocks_entry):
+        """
+        Extract raw P/R numerators and denominators for one file evaluation.
+
+        Returns a dict with:
+            precision_num   = matched_gt_lines + tolerance
+            precision_denom = predicted_pos_lines
+            recall_num      = true_pos_blocks
+            recall_denom    = actual_pos_blocks
+        """
+        gt_blocks = parse_diff_to_blocks(gt_diff)
+        actual_pos_blocks = len(gt_blocks)
+        predicted_pos_lines = len(pred_diff)
+        tolerance = sum(m["tolerance"] for _, m in matched_blocks_entry.items())
+
+        matched_gt_block_ids = set()
+        matched_gt_lines = 0
+        for _, match in matched_blocks_entry.items():
+            if match.get("success", True) and match.get("gt_match_count", 0) > 0:
+                if "gt_blocks" in match:
+                    for gb in match["gt_blocks"]:
+                        matched_gt_block_ids.add(gb["block_id"])
+                        matched_gt_lines += len(gb["diff"])
+                else:
+                    em_line = match["block_start"]
+                    for gb in gt_blocks:
+                        if gb["block_start"] <= em_line <= gb["block_end"]:
+                            matched_gt_block_ids.add(gb["block_id"])
+                            break
+                    matched_gt_lines += len(match.get("diff", {})) or 1
+
+        return {
+            "precision_num": matched_gt_lines + tolerance,
+            "precision_denom": predicted_pos_lines,
+            "recall_num": len(matched_gt_block_ids),
+            "recall_denom": actual_pos_blocks,
+        }
+
+    def run_cross_file_evaluation(self, results, round=None):
+        """
+        Score cross-file instances. P/R is micro-averaged across files per instance;
+        unit score is 1 iff all files pass their tests.
+        """
+        if round:
+            self.round = round
+        elif results:
+            self.round = results[0].get("round", 1)
+
+        cross_file_scores = {"Unit score": {}, "Symbolic block scores": {}}
+
+        # ---- symbolic block scores (no Docker needed) ----
+        for item in results:
+            task_id = item["task_id"]
+            files = item.get("files", [])
+            file_results = item.get("debug_results", {}).get("file_results", [])
+
+            if not file_results:
+                cross_file_scores["Symbolic block scores"][task_id] = {
+                    "precision": 0.0, "recall": 0.0, "f1": 0.0,
+                    "note": "no model output"
+                }
+                continue
+
+            sum_p_num = sum_p_denom = sum_r_num = sum_r_denom = 0
+            per_file_details = []
+            for file_item, fr in zip(files, file_results):
+                gt_diff = file_item.get("gt_diff", {})
+                pred_diff = fr.get("pred_diff", {})
+
+                if not gt_diff:
+                    continue
+
+                # Pass-1 exact match only (no Docker needed for structural scoring).
+                tmp_args = copy.copy(self)
+                from collections import defaultdict as _dd
+                mb = _dd(dict)
+                gt_blocks = parse_diff_to_blocks(gt_diff)
+                pred_blocks = parse_diff_to_blocks(pred_diff)
+                em_count = 0
+                matched_gt_set = set()
+                for pb in pred_blocks:
+                    for gb in gt_blocks:
+                        if (pb["block_start"] == gb["block_start"]
+                                and pb["block_end"] == gb["block_end"]
+                                and len(pb["diff"]) == len(gb["diff"])
+                                and all(
+                                    k in gb["diff"]
+                                    and pb["diff"][k]["original"] == gb["diff"][k]["original"]
+                                    and pb["diff"][k]["modified"] == gb["diff"][k]["modified"]
+                                    for k in pb["diff"]
+                                )):
+                            if gb["block_id"] not in matched_gt_set:
+                                matched_gt_set.add(gb["block_id"])
+                                key = f"{task_id}_em_{em_count}"
+                                mb[task_id][key] = {
+                                    "block_start": pb["block_start"],
+                                    "block_end": pb["block_end"],
+                                    "diff": dict(pb["diff"]),
+                                    "block_id": gb["block_id"],
+                                    "success": True,
+                                    "gt_match_count": 1,
+                                    "tolerance": 0,
+                                }
+                                em_count += 1
+                            break
+
+                comps = self._extract_pr_components(gt_diff, pred_diff, mb[task_id])
+                sum_p_num   += comps["precision_num"]
+                sum_p_denom += comps["precision_denom"]
+                sum_r_num   += comps["recall_num"]
+                sum_r_denom += comps["recall_denom"]
+                per_file_details.append({
+                    "target_file": file_item["target_file"],
+                    **comps,
+                })
+
+            precision = min(sum_p_num / sum_p_denom, 1.0) if sum_p_denom > 0 else 0.0
+            recall    = min(sum_r_num / sum_r_denom, 1.0) if sum_r_denom > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+
+            cross_file_scores["Symbolic block scores"][task_id] = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "per_file": per_file_details,
+                "sums": {
+                    "precision_num": sum_p_num,
+                    "precision_denom": sum_p_denom,
+                    "recall_num": sum_r_num,
+                    "recall_denom": sum_r_denom,
+                },
+            }
+
+        # ---- unit score ----
+        verify_entries = []
+        for item in results:
+            task_id = item["task_id"]
+            files = item.get("files", [])
+            file_results = item.get("debug_results", {}).get("file_results", [])
+            for file_item, fr in zip(files, file_results):
+                sub_id = f"{task_id}__file__{file_item['target_file'].replace('/', '_')}"
+                verify_entries.append({
+                    "task_id": sub_id,
+                    "cross_parent": task_id,
+                    "solution": fr.get("solution", ""),
+                    "buggy_code": file_item.get("buggy_code", ""),
+                    "gt_solution": file_item.get("gt_solution", ""),
+                    "target_file": file_item.get("target_file", "solution.py"),
+                    "repo": item.get("repo", ""),
+                    "image_name": item.get("image_name", ""),
+                    "FAIL_TO_PASS": file_item.get("FAIL_TO_PASS", []),
+                    "PASS_TO_PASS": file_item.get("PASS_TO_PASS", []),
+                })
+
+        if verify_entries:
+            import json as _json
+            from pathlib import Path as _Path
+            cross_verify_file = self.log_dir + f"/{self.model_name}_cross_fix_verify.jsonl"
+            _Path(cross_verify_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(cross_verify_file, "w") as _f:
+                for _e in verify_entries:
+                    _f.write(_json.dumps(_e) + "\n")
+            fail_ids, correct_ids, _ = self.handler.verify_cross_fix(
+                cross_verify_file, timeout=1800)
+            correct_set = set(correct_ids)
+
+            # Instance passes only if ALL its file sub-entries pass
+            for item in results:
+                task_id = item["task_id"]
+                files = item.get("files", [])
+                file_results = item.get("debug_results", {}).get("file_results", [])
+                all_pass = all(
+                    f"{task_id}__file__{fi['target_file'].replace('/', '_')}" in correct_set
+                    for fi in files
+                )
+                cross_file_scores["Unit score"][task_id] = 1 if all_pass else 0
+        else:
+            for item in results:
+                cross_file_scores["Unit score"][item["task_id"]] = 0
+
+        self.scores = cross_file_scores
+        self.results = results
+        self.round = round or 1
+        self._annotate_unit_gated()
+
+        # Print summary
+        n = len(results)
+        if n > 0:
+            sym = cross_file_scores["Symbolic block scores"]
+            unit = cross_file_scores["Unit score"]
+            avg_p = sum(v["precision"] for v in sym.values()) / n
+            avg_r = sum(v["recall"] for v in sym.values()) / n
+            avg_f = sum(v["f1"] for v in sym.values()) / n
+            avg_u = sum(unit.values()) / n
+            print(f"[cross-file summary] unit={avg_u:.3f} prec={avg_p:.3f} "
+                  f"rec={avg_r:.3f} f1={avg_f:.3f} (n={n})")
+
+        save_file = self.output_dir + f"/{self.model_name}_on_{self.eval_set_name}_cross_round_{self.round}_scores.json"
+        with open(save_file, "w") as f:
+            json.dump(cross_file_scores, f, indent=2)
+        print(f"Cross-file scores saved to {save_file}")
+        return cross_file_scores
 
     def save_results(self):
         save_file = self.output_dir + f"/{self.model_name}_on_{self.eval_set_name}_round_{self.round}_scores.json"
@@ -609,16 +886,25 @@ class Evaluator:
         """
         unit = self.scores.get("Unit score", {}) or {}
         sym = self.scores.get("Symbolic block scores", {}) or {}
-        n = len(unit)
+        # Structural-only runs (e.g. swesmith with PDB_SWE_BACKEND=none) carry
+        # no Unit score; fall back to the symbolic count so the summary still
+        # reports precision/recall and print "unit=NA".
+        n = len(unit) or len(sym)
         if n == 0:
             print(f"[summary] {self.model_name} on {self.eval_set_name} round {self.round}: (no results)")
             return
-        u = sum(unit.values())
+        unit_str = f"{sum(unit.values())/len(unit):.3f}" if unit else "NA"
         p = sum(v["precision"] for v in sym.values())
         r = sum(v["recall"]    for v in sym.values())
         f = sum(v["f1"]        for v in sym.values())
+        ug = sum(v.get("unit_gated_f1", v["f1"]) for v in sym.values())
+        ugr = sum(v.get("unit_gated_recall", v["recall"]) for v in sym.values())
+        el = sum(v.get("edit_line", 0)   for v in sym.values())
+        eb = sum(v.get("edit_blocks", 0) for v in sym.values())
         print(f"[summary] {self.model_name} on {self.eval_set_name} round {self.round}: "
-              f"unit={u/n:.3f} prec={p/n:.3f} rec={r/n:.3f} f1={f/n:.3f} (n={n})")
+              f"unit={unit_str} prec={p/n:.3f} rec={r/n:.3f} f1={f/n:.3f} "
+              f"ugrec={ugr/n:.3f} ugf1={ug/n:.3f} "
+              f"eline={el/n:.2f} eblk={eb/n:.2f} (n={n})")
 
 
 if __name__ == "__main__":
@@ -637,6 +923,9 @@ if __name__ == "__main__":
                              f"block for full precision credit. 0=strict. If unset, defaults to "
                              f"{DEFAULT_TOLERANCE_SINGLELINE} in --mode single and "
                              f"{DEFAULT_TOLERANCE_MULTILINE} in --mode multi.")
+    parser.add_argument("--pred_diff_guard", action=argparse.BooleanOptionalAction, default=False,
+                        help="Skip scoring predictions far larger than GT (0/0/0). Default off "
+                             "(faithful eval); the RL reward path turns it on to protect the reward.")
     parser.add_argument("--max_iter", type=int, default=1, help="Maximum number of add-bug iterations")
     parser.add_argument("--reload_first_round", action="store_true", help="Whether to reload first round results")
     parser.add_argument("--reload_result_file", type=str, default=1, help="The result file to reload")

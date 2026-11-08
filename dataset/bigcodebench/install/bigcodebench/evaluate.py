@@ -191,8 +191,11 @@ def evaluate(
     max_stack_limit: int = 10,
     check_gt_only: bool = False,
     no_gt: bool = False,
+    problems: Optional[dict] = None,
     **model_kwargs,
-):  
+):
+    # `problems`: optional pre-loaded dataset (used by worker_loop.py so the
+    # dataset is loaded once per process); None loads it via get_bigcodebench.
     if not samples and model_kwargs:
         samples = run_codegen(
             split=split,
@@ -285,7 +288,7 @@ def evaluate(
                 selected_ids = ""
 
         if parallel < 1:
-            n_workers = max(1, multiprocessing.cpu_count() // 2)
+            n_workers = 64
         else:
             n_workers = parallel
 
@@ -294,8 +297,9 @@ def evaluate(
             samples = "__dummy__.jsonl"
 
         # breakpoint()
-        problems = get_bigcodebench(subset=subset)
-        
+        if problems is None:
+            problems = get_bigcodebench(subset=subset)
+
         # Add selective evaluation logic
         if selected_ids:
             problems = {k: v for k, v in problems.items() if k in selected_ids}

@@ -12,10 +12,17 @@ from lcb_runner.runner.scenario_router import (
 )
 
 
-def main():
-    args = get_args()
+def run(args, *, benchmark=None):
+    """Score `args.custom_output_file` against the LCB benchmark.
 
-    benchmark, _ = build_prompt_benchmark(args)
+    `benchmark` may be a pre-loaded list (from a previous build_prompt_benchmark
+    call) — used by the persistent reward worker
+    (see PDB/dataset/livecodebench/install/worker_loop.py) so the ~150 s
+    benchmark cold start is paid once per training job, not per step.
+    Falls back to build_prompt_benchmark(args) when None (CLI path).
+    """
+    if benchmark is None:
+        benchmark, _ = build_prompt_benchmark(args)
 
     with open(args.custom_output_file, "r") as f:
         custom_outputs = json.load(f)
@@ -83,7 +90,7 @@ def main():
                 custom_outputs = [
                     custom_output['pred_list']
                     for custom_output in sorted(
-                        custom_outputs, key=lambda x: int(x.id.split("_")[1])
+                        custom_outputs, key=lambda x: int(x["id"].split("_")[1])
                     )
                 ]
 
@@ -134,6 +141,11 @@ def main():
     
     with open(output_path.replace(".json", "_eval_all.json"), "w") as f:
         json.dump(save_eval_results, f, indent=4)
+
+
+def main():
+    run(get_args())
+
 
 if __name__ == "__main__":
     main()

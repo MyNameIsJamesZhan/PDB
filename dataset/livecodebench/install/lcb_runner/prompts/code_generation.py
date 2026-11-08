@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 try:
     from anthropic import HUMAN_PROMPT, AI_PROMPT
@@ -166,18 +167,22 @@ def get_deepseek_r1_question_template_answer(question: CodeGenerationProblem):
     return prompt
 
 
-with open("lcb_runner/prompts/few_shot_examples/generation/func.json") as f:
-    func = json.load(f)
-
-with open("lcb_runner/prompts/few_shot_examples/generation/stdin.json") as f:
-    stdin = json.load(f)
+def _load_base_model_examples(kind: str):
+    examples_path = (
+        Path(__file__).resolve().parent
+        / "few_shot_examples"
+        / "generation"
+        / f"{kind}.json"
+    )
+    with examples_path.open("r") as f:
+        return json.load(f)
 
 
 def get_base_model_question_template_answer(question: CodeGenerationProblem):
     if question.starter_code:
-        examples_json = func
+        examples_json = _load_base_model_examples("func")
     else:
-        examples_json = stdin
+        examples_json = _load_base_model_examples("stdin")
 
     def get_example_prompt(example):
         prompt = ""

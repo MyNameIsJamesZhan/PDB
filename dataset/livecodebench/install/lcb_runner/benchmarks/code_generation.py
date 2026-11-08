@@ -1,12 +1,14 @@
 import json
+import os
 import zlib
 import pickle
 import base64
 from enum import Enum
+from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 
 class Platform(Enum):
@@ -122,7 +124,14 @@ class CodeGenerationProblem:
 
 
 def load_code_generation_dataset(release_version="release_v1", start_date=None, end_date=None) -> list[CodeGenerationProblem]:
-    dataset = load_dataset("livecodebench/code_generation_lite", split="test", version_tag=release_version, trust_remote_code=True)
+    # If LCB_CODEGEN_LITE_DIR is set and <dir>/<release_version> exists, load the
+    # pre-downloaded dataset from disk (offline use); otherwise download from the Hub.
+    override_root = os.environ.get("LCB_CODEGEN_LITE_DIR")
+    local_path = Path(override_root) / release_version if override_root else None
+    if local_path is not None and local_path.exists():
+        dataset = load_from_disk(str(local_path))
+    else:
+        dataset = load_dataset("livecodebench/code_generation_lite", split="test", version_tag=release_version, trust_remote_code=True)
     dataset = [CodeGenerationProblem(**p) for p in dataset]  # type: ignore
     if start_date is not None:
         p_start_date = datetime.strptime(start_date, "%Y-%m-%d")

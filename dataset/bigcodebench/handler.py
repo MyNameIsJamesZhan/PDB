@@ -15,7 +15,11 @@ class BigCodeBenchHandler(DatasetHandler):
     and test suites. Evaluation runs via the `bigcodebench.evaluate` CLI tool.
     """
 
-    GT_DATA_PATH = "dataset/bigcodebench/data/full_data.json"
+    # Resolved relative to this file (no chdir needed); override via the env var.
+    GT_DATA_PATH = os.environ.get(
+        "BCB_FULL_DATA_PATH",
+        str(Path(__file__).parent / "data" / "full_data.json"),
+    )
 
     def preprocess(self, raw_data):
         """
@@ -46,7 +50,7 @@ class BigCodeBenchHandler(DatasetHandler):
             raise NotImplementedError
         return processed_data
 
-    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=20, timeout=1800):
+    def verify_unit_test(self, verify_file, gt_file=None, timeout_per_task=60, timeout=1800, calibrated=True, parallel=-1):
         """
         Run unit tests using the bigcodebench.evaluate CLI.
 
@@ -89,6 +93,29 @@ class BigCodeBenchHandler(DatasetHandler):
         if selected_ids is not None:
             eval_args += ["--selective_evaluate", selected_ids]
         eval_args.append("--no_gt")
+        # calibrated=True prepends code_prompt + "pass" (BCB's completion-style
+        # default), which duplicates the function def of a full-file solution; pass
+        # calibrated=False to run the solution as-is.
+        eval_args += ["--calibrated", str(calibrated)]
+        # evaluate.py defaults to 64 workers regardless of the CPU affinity, which
+        # oversubscribes cores and times out correct-but-slow tasks; always pass an
+        # explicit bound derived from the affinity.
+        if not parallel or parallel < 1:
+            n_cpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 8)
+            # Cap at 8: heavy tasks exceed the per-task wall-clock under more contention.
+            parallel = max(1, min(n_cpu - 1, 8))
+        eval_args += ["--parallel", str(parallel)]
+
+        # One BLAS/OpenMP thread per harness worker (subprocess env only): unbounded
+        # BLAS threads oversubscribe the cores and push tasks past the per-task
+        # wall-clock, which scores them as failures.
+        score_env = {
+            **os.environ,
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+        }
 
         try:
             subprocess.run(
@@ -96,6 +123,7 @@ class BigCodeBenchHandler(DatasetHandler):
                 cwd=workdir,
                 check=True,
                 timeout=timeout,
+                env=score_env,
             )
         except subprocess.CalledProcessError as e:
             print("Command failed with an error.")
@@ -121,10 +149,81 @@ class BigCodeBenchHandler(DatasetHandler):
                     correct_ids.append(task_id)
                 else:
                     fail_ids.append(task_id)
-                    fail_feedback.append(json.dumps(perfs[0].get("details", ""), indent=2))
+                    fail_feedback.append(self._bcb_feedback(perfs[0].get("details")))
             return fail_ids, correct_ids, fail_feedback
         else:
             raise FileNotFoundError(f"Cannot locate evaluation results for {base_name}")
+
+    @classmethod
+    def _bcb_feedback(cls, details) -> str:
+        """Turn BCB's per-test ``{test_name: traceback}`` details into uniform
+        (input, expected, got) triples. BCB tests are unittest assertion methods,
+        so ``input`` is the test-case name and expected/got come from the
+        ``AssertionError: <got> != <expected>`` line (falling back to the raised
+        exception line for non-assertion failures)."""
+        if isinstance(details, dict) and details:
+            return cls.format_failed_cases(
+                [cls._bcb_case(name, str(trace)) for name, trace in details.items()]
+            )
+        if details:  # timeout/error with a non-dict detail blob
+            return cls.format_failed_cases([{"got": str(details)}])
+        return ""
+
+    @staticmethod
+    def _bcb_case(test_name: str, trace: str) -> dict:
+        case = {"input": test_name, "expected": None, "got": None}
+        idx = trace.find("AssertionError:")
+        if idx != -1:
+            line = trace[idx + len("AssertionError:"):].split("\n", 1)[0].strip()
+            if " != " in line:
+                got, expected = line.split(" != ", 1)
+                case["got"], case["expected"] = got.strip(), expected.strip()
+            else:
+                case["got"] = line or "AssertionError"
+        else:
+            non_empty = [ln for ln in trace.splitlines() if ln.strip()]
+            case["got"] = non_empty[-1].strip() if non_empty else "error"
+        return case
+
+    def build_worker_request(self, verify_file, gt_file=None, timeout_per_task=20,
+                              timeout=1800, compact_feedback=False):
+        """Shape the JSON request that the BCB persistent worker expects.
+
+        The wire format passes verify_file + gt_file PATHS (not contents) —
+        the manager has already written them via build_verify_unit_test +
+        save_formatted_gt, and the worker reads them off the shared filesystem.
+        Mirrors verify_unit_test()'s gt_file requirement: BCB always needs a
+        gt_file because eval depends on the canonical task metadata.
+
+        compact_feedback=True drops per-test traceback / stdout / stderr from
+        fail_feedback (keeps the field as empty strings for protocol compat).
+        Caller should set this in the RL reward path — the details are never
+        read there, and emitting them can push the JSON response past
+        asyncio's 64 KiB StreamReader limit and corrupt the flush.
+
+        See install/worker_loop.py for the receiving end.
+        """
+        if gt_file is None:
+            raise ValueError("BCB worker requires gt_file (build via save_formatted_gt)")
+        if Path(verify_file).parent != Path(gt_file).parent:
+            raise ValueError(
+                f"verify_file and gt_file must share a parent directory; "
+                f"got {Path(verify_file).parent} vs {Path(gt_file).parent}"
+            )
+        return {
+            "op": "score",
+            "verify_file": str(verify_file),
+            "gt_file": str(gt_file),
+            "timeout_per_task": timeout_per_task,
+            "compact_feedback": compact_feedback,
+        }
+
+    def parse_worker_response(self, resp):
+        """Unpack the worker's score response into (fail_ids, correct_ids, fail_feedback).
+
+        Identical shape to verify_unit_test() so callers can swap the two.
+        """
+        return resp["fail_ids"], resp["correct_ids"], resp["fail_feedback"]
 
     def build_verify_unit_test(self, log_file_prefix, results, sol_field="solution"):
         """

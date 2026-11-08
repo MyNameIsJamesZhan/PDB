@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import sys
 import faulthandler
 import platform
@@ -49,8 +50,22 @@ class TimeoutException(Exception):
 
 
 def timeout_handler(signum, frame):
-    print("timeout occured: alarm went off")
     raise TimeoutException
+
+
+# Drop stdout writes past 1 MiB to bound RSS when a candidate floods print(...).
+_CAPTURE_MAX_CHARS = 1 * 1024 * 1024
+
+
+class _TruncatingStringIO(StringIO):
+    def write(self, s):
+        cur = self.tell()
+        if cur >= _CAPTURE_MAX_CHARS:
+            return len(s)
+        remaining = _CAPTURE_MAX_CHARS - cur
+        if len(s) > remaining:
+            s = s[:remaining]
+        return super().write(s)
 
 
 # used to capture stdout as a list
@@ -59,7 +74,7 @@ def timeout_handler(signum, frame):
 class Capturing(list):
     def __enter__(self):
         self._stdout = sys.stdout
-        sys.stdout = self._stringio = StringIO()
+        sys.stdout = self._stringio = _TruncatingStringIO()
         # Make closing the StringIO a no-op
         self._stringio.close = lambda x: 1
         return self
@@ -433,8 +448,18 @@ def run_test(sample, test=None, debug=False, timeout=6):
     signal.signal(signal.SIGALRM, timeout_handler)
 
     # Disable functionalities that can make destructive changes to the test.
-    # max memory is set to 4GB
-    reliability_guard()
+    # Cap per-candidate memory so a runaway allocation is killed before it can OOM
+    # the host. Default 4 GiB (training reward); raise PDB_LCB_MEM_GB for evaluation,
+    # where some memoized reference solutions legitimately need more.
+    _mem_gb = int(os.environ.get("PDB_LCB_MEM_GB", "4"))
+    _mem_bytes = _mem_gb * 1024**3
+    # RLIMIT_AS includes the address space inherited from the parent. Candidates
+    # forked from the persistent worker inherit its large heap, so an absolute cap can
+    # sit below the inherited size and fail every new mapping with a bare MemoryError.
+    # PDB_LCB_MEM_RELATIVE=1 caps *additional* allocation at PDB_LCB_MEM_GB instead.
+    if os.environ.get("PDB_LCB_MEM_RELATIVE", "0") == "1":
+        _mem_bytes += _current_vm_bytes()
+    reliability_guard(maximum_memory_bytes=_mem_bytes)
 
     if debug:
         print(f"start = {datetime.now().time()}")
@@ -504,6 +529,17 @@ def run_test(sample, test=None, debug=False, timeout=6):
                 }
             finally:
                 signal.alarm(0)
+
+
+def _current_vm_bytes():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
 
 
 def reliability_guard(maximum_memory_bytes=None):
